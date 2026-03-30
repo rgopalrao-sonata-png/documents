@@ -82,19 +82,20 @@ If a learner has more than one subscription license and enrolls in a course that
 
 ```mermaid
 flowchart TD
-    A[test-multi-alice] --> L1[Leadership License\nc1111111-1111-1111-1111-111111111111]
-    A --> L2[Technical License\nc2222222-2222-2222-2222-222222222222]
-    A --> L3[Compliance License\nc3333333-3333-3333-3333-333333333333]
+    A[test-multi-alice] --> L1[Leadership License<br/>c1111111-1111-1111-1111-111111111111]
+    A --> L2[Technical License<br/>c2222222-2222-2222-2222-222222222222]
+    A --> L3[Compliance License<br/>c3333333-3333-3333-3333-333333333333]
 
-    L1 --> C1[Leadership Catalog\n11111111-1111-1111-1111-111111111111]
-    L2 --> C2[Technical Catalog\n22222222-2222-2222-2222-222222222222]
-    L3 --> C3[Compliance Catalog\n33333333-3333-3333-3333-333333333333]
+    L1 --> C1[Leadership Catalog<br/>11111111-1111-1111-1111-111111111111]
+    L2 --> C2[Technical Catalog<br/>22222222-2222-2222-2222-222222222222]
+    L3 --> C3[Compliance Catalog<br/>33333333-3333-3333-3333-333333333333]
 
     C1 --> OC[MITx+6.00.1x]
     C2 --> OC
     C3 --> OC
 
-    OC --> R[Expected enrollment license = first activated]\n    R --> W[c1111111-1111-1111-1111-111111111111]
+    OC --> R[Expected enrollment license = first activated]
+    R --> W[c1111111-1111-1111-1111-111111111111]
 ```
 
 ---
