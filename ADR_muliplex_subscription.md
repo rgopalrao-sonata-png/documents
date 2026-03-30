@@ -5,7 +5,7 @@
 | **Status** | Proposed |
 | **Date** | 2026-03-30 |
 | **Version** | 1.0 |
-| **Author** | Architecture Team |
+| **Author** | |
 | **Scope** | `enterprise-access` · `enterprise-catalog` · `frontend-app-learner-portal-enterprise` |
 
 ## Context
