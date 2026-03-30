@@ -1,9 +1,12 @@
-# ADR 0010: Event-Driven Support for Multiplex Subscriptions
+# 0010. Multiplex Subscription Licenses — Technical Architecture
 
-- **Status:** Proposed
-- **Date:** 2026-03-30
-- **Authors:** Architecture Proposal
-- **Decision Type:** Domain Event Design / Integration Architecture
+| Field | Value |
+|---|---|
+| **Status** | Proposed |
+| **Date** | 2026-03-30 |
+| **Version** | 1.0 |
+| **Author** | Architecture Team |
+| **Scope** | `enterprise-access` · `enterprise-catalog` · `frontend-app-learner-portal-enterprise` |
 
 ## Context
 
