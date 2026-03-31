@@ -426,7 +426,7 @@ Carol → Leadership
 Eve → Leadership
 Reference: MULTI-LICENSE-TESTING-CHECKLIST.md
 
-GPT-5.4 • 1x
+
 
 ## Final Sign-off
 
