@@ -378,6 +378,42 @@ If a test fails, verify these in order:
 
 ---
 
+Steering
+Use these course pages.
+
+Alice
+Leadership: edX+M12
+Technical: SONATA+123
+Compliance / overlap: edX+DemoX
+Negative check: edX+P315
+Bob
+Technical: SONATA+123
+Compliance / overlap: edX+DemoX
+Data Science: edX+P315
+Business: edX+M12
+Carol
+Leadership: edX+M12
+Technical: SONATA+123
+Compliance / overlap: edX+DemoX
+Data Science: edX+P315
+Business: edX+M12
+Dave
+Activated license path: edX+M12
+Assigned license path: SONATA+123
+Assigned / overlap path: edX+DemoX
+Eve
+Overlap / tie-break: edX+DemoX
+Leadership: edX+M12
+Expected overlap winner on edX+DemoX:
+
+Alice → Leadership
+Bob → Technical
+Carol → Leadership
+Eve → Leadership
+Reference: MULTI-LICENSE-TESTING-CHECKLIST.md
+
+GPT-5.4 • 1x
+
 ## Final Sign-off
 
 - [ ] Alice verified
