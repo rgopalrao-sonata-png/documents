@@ -91,18 +91,32 @@ Enterprise slug used by the seed data:
 
 - `test-multi-enterprise`
 
-### Shared direct course URLs
 
-- Leadership: `http://localhost:8734/test-multi-enterprise/course/course-v1:TestOrg+LEADER101+2024`
-- Leadership 2: `http://localhost:8734/test-multi-enterprise/course/course-v1:TestOrg+LEADER201+2024`
-- Technical: `http://localhost:8734/test-multi-enterprise/course/course-v1:TestOrg+TECH101+2024`
-- Technical 2: `http://localhost:8734/test-multi-enterprise/course/course-v1:TestOrg+TECH201+2024`
-- Compliance: `http://localhost:8734/test-multi-enterprise/course/course-v1:TestOrg+COMP101+2024`
-- Data Science: `http://localhost:8734/test-multi-enterprise/course/course-v1:TestOrg+DS101+2024`
-- Data Science 2: `http://localhost:8734/test-multi-enterprise/course/course-v1:TestOrg+DS201+2024`
-- Business: `http://localhost:8734/test-multi-enterprise/course/course-v1:TestOrg+BUS101+2024`
-- Multi-catalog: `http://localhost:8734/test-multi-enterprise/course/course-v1:TestOrg+MULTI101+2024`
-- Universal: `http://localhost:8734/test-multi-enterprise/course/course-v1:TestOrg+UNIVERSAL+2024`
+### User License, Catalog, and Course Mapping (Current Experience)
+
+| User  | Licenses (Catalogs) | Courses Accessible | Direct Links |
+|-------|---------------------|--------------------|--------------|
+| **Alice** | Leadership, Technical, Compliance | edX+M12 (Leadership), SONATA+123 (Technical), edX+DemoX (Leadership license wins) | [edX+M12](http://localhost:8734/test-multi-enterprise/course/edX+M12), [SONATA+123](http://localhost:8734/test-multi-enterprise/course/SONATA+123), [edX+DemoX](http://localhost:8734/test-multi-enterprise/course/edX+DemoX) |
+| **Bob**   | Technical, Compliance, Data Science, Business | SONATA+123 (Technical), edX+DemoX (Technical license wins), edX+P315 (Data Science), edX+M12 (Business) | [SONATA+123](http://localhost:8734/test-multi-enterprise/course/SONATA+123), [edX+DemoX](http://localhost:8734/test-multi-enterprise/course/edX+DemoX), [edX+P315](http://localhost:8734/test-multi-enterprise/course/edX+P315), [edX+M12](http://localhost:8734/test-multi-enterprise/course/edX+M12) |
+| **Carol** | Leadership, Technical, Compliance, Data Science, Business | edX+M12 (Leadership/Business), SONATA+123 (Technical), edX+DemoX (Leadership license wins), edX+P315 (Data Science) | [edX+M12](http://localhost:8734/test-multi-enterprise/course/edX+M12), [SONATA+123](http://localhost:8734/test-multi-enterprise/course/SONATA+123), [edX+DemoX](http://localhost:8734/test-multi-enterprise/course/edX+DemoX), [edX+P315](http://localhost:8734/test-multi-enterprise/course/edX+P315) |
+| **Dave**  | Leadership (activated), Technical (assigned), Compliance (assigned) | edX+M12 (Leadership, access), SONATA+123 (Technical, no access until activated), edX+DemoX (Compliance/overlap, no access until activated) | [edX+M12](http://localhost:8734/test-multi-enterprise/course/edX+M12), [SONATA+123](http://localhost:8734/test-multi-enterprise/course/SONATA+123), [edX+DemoX](http://localhost:8734/test-multi-enterprise/course/edX+DemoX) |
+| **Eve**   | Leadership, Technical, Compliance | edX+M12 (Leadership), SONATA+123 (Technical), edX+DemoX (Leadership license wins) | [edX+M12](http://localhost:8734/test-multi-enterprise/course/edX+M12), [SONATA+123](http://localhost:8734/test-multi-enterprise/course/SONATA+123), [edX+DemoX](http://localhost:8734/test-multi-enterprise/course/edX+DemoX) |
+
+**Legend:**
+- For overlap courses (edX+DemoX), the “winner” is the earliest activated license for that user.
+- All links are to the current local devstack URLs.
+
+#### Negative/No Access Example
+- Alice: [edX+P315](http://localhost:8734/test-multi-enterprise/course/edX+P315) (should NOT have access)
+
+#### Catalog-to-Course Mapping
+| Catalog      | Courses                |
+|--------------|-----------------------|
+| Leadership   | edX+M12, edX+DemoX    |
+| Technical    | SONATA+123, edX+DemoX |
+| Compliance   | edX+DemoX             |
+| Data Science | edX+P315              |
+| Business     | edX+M12               |
 
 ### Course coverage by learner
 
@@ -422,4 +436,3 @@ GPT-5.4 • 1x
 - [ ] Dave verified
 - [ ] Eve verified
 - [ ] multi-license learner portal behavior validated
-
