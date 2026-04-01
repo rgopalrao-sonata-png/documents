@@ -2,7 +2,7 @@
 
 **Author:** Platform Architect  
 **Date:** April 1, 2026  
-**Status:** Approved for Implementation  
+**Status:** Draft for Implementation  
 **Ticket:** ENT-11183  
 **Repos Affected:**
 - `frontend-app-admin-portal` ✅ (frontend — done)
@@ -657,49 +657,7 @@ abbey@bestrun.com,Abbey,...,44%,32%,Failed,...
 
 ---
 
-## 13. Testing Plan
 
-### Frontend Unit Tests
-
-**File:** `src/components/EnrollmentsTable/EnrollmentsTable.test.jsx`
-
-| Test Case | Expected Outcome |
-|---|---|
-| Renders `Course Progress` column header | Column header visible in table |
-| Formats `course_progress: 0.0119` → `1%` | Cell shows `1%` |
-| Formats `course_progress: 1.0` → `100%` | Cell shows `100%` |
-| Formats `course_progress: null` → `""` | Cell shows empty string |
-| Sorts by `course_progress` | Table re-orders by completion % |
-| Snapshot test | Update snapshot to include new column |
-
-### Frontend Integration / E2E Tests
-
-| Test Case | Tool |
-|---|---|
-| LPR table renders `Course Progress` column with real API data | Cypress |
-| CSV download includes `course_progress` column | Cypress |
-| Sorting by `course_progress` updates URL params | Cypress |
-
-### Backend Unit Tests
-
-| Test Case |
-|---|
-| Serializer returns `course_progress` field |
-| `course_progress = null` when `complete_count` is `None` |
-| `course_progress = 0.0` when `complete_count = 0` and total > 0 |
-| `course_progress = 1.0` when all units complete |
-| Division by zero guard: returns `null` when total = 0 |
-| CSV response includes `course_progress` column |
-
-### Data Pipeline Tests
-
-| Test Case |
-|---|
-| `complete_count`, `incomplete_count`, `locked_count` populated after ETL run |
-| `complete_count + incomplete_count + locked_count` matches total blocks for a course |
-| Nightly refresh updates stale completion data |
-
----
 
 ## 14. Dependencies & Risks
 
