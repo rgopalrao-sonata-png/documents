@@ -1454,20 +1454,22 @@ Current expiration processing may still move the learner to **Audit** because it
 
 ### Diagram: Current vs Desired Behavior
 
+## Multi-License Expiry Behavior (Verified vs Audit)
+
 ```mermaid
 flowchart LR
-    subgraph CURRENT[Current System Behavior]
-        A1["Learner has:\nLicense A = expiring\nLicense B = still active\nSame course"] --> A2["Expiry job runs for License A"]
+    subgraph CURRENT["Current System Behavior"]
+        A1["Learner has:<br/>License A = expiring<br/>License B = still active<br/>Same course"] --> A2["Expiry job runs for License A"]
         A2 --> A3["Find enrollments tied to License A"]
-        A3 --> A4["Downgrade all found enrollments\nVerified -> Audit"]
-        A4 --> A5["Result:\nLearner moved to Audit\n(even though License B is active)"]
+        A3 --> A4["Downgrade all found enrollments<br/>Verified -> Audit"]
+        A4 --> A5["Result:<br/>Learner moved to Audit<br/>(even though License B is active)"]
     end
 
-    subgraph DESIRED[Desired/Future Safe Behavior]
-        B1["Learner has:\nLicense A = expiring\nLicense B = still active\nSame course"] --> B2["Expiry job runs for License A"]
-        B2 --> B3["Before downgrade, check:\nAny other active license for same learner + course?"]
+    subgraph DESIRED["Desired/Future Safe Behavior"]
+        B1["Learner has:<br/>License A = expiring<br/>License B = still active<br/>Same course"] --> B2["Expiry job runs for License A"]
+        B2 --> B3["Before downgrade, check:<br/>Any other active license for same learner + course?"]
         B3 --> B4{"Active backup license exists?"}
-        B4 -->|Yes| B5["Keep learner in Verified\nNo downgrade"]
+        B4 -->|Yes| B5["Keep learner in Verified<br/>No downgrade"]
         B4 -->|No| B6["Downgrade Verified -> Audit"]
     end
 ### The Gap
