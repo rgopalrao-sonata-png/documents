@@ -28,6 +28,9 @@
 5. [Phased Delivery Plan](#5-phased-delivery-plan)
 6. [Repository Touchpoints](#6-repository-touchpoints)
 7. [ADRs — Architecture Decision Records](#7-adrs--architecture-decision-records)
+8. [Generic Reusable Solution for All Dynamic Filter Tickets](#8-generic-reusable-solution-for-all-dynamic-filter-tickets)
+9. [Efficient Backend-Centric Translation Model](#9-efficient-backend-centric-translation-model)
+10. [Industry Filter Example — Skills Quiz](#10-industry-filter-example--skills-quiz)
 
 ---
 
@@ -914,6 +917,468 @@ Effort: Medium | Impact: High | Risk: Low
 3. Whether values are dynamic (Algolia) or static (component-hardcoded)
 
 Once confirmed, apply the matching strategy from the Translation Classification Matrix above.
+
+---
+
+## 8. Generic Reusable Solution for All Dynamic Filter Tickets
+
+This section describes the **reusable enterprise pattern** that should be used for all future translation tickets, including:
+
+- Skills filter
+- Subject filter
+- Industry filter
+- Job title filter
+- Ability filter
+- Learning type / level / partner / provider filters
+- Any future Algolia-backed dynamic dropdown
+
+### Core Recommendation
+
+Use a **3-layer translation model**:
+
+1. **Static UI text**
+   - Example: `Industry`, `Find an industry...`, `Skills`, `Find a skill...`
+   - Stored in frontend message catalogs via `defineMessages`
+   - Translated by normal frontend i18n pipeline
+
+2. **Canonical business value**
+   - Example: `industry_id = fintech`, `industry_code = healthcare`, `skill_key = machine-learning`
+   - Stored once in database / taxonomy source as the **stable key**
+   - Never changes with locale
+   - Used for quiz logic, recommendations, filtering, analytics, and persistence
+
+3. **Localized display value**
+   - Example:
+     - `fintech` → `Financial Technology` in English
+     - `fintech` → `Tecnología financiera` in Spanish
+   - Stored in translation tables and indexed into Algolia
+   - Used only for UI display and localized search typing
+
+### Why this is the right generic solution
+
+This solves the root problem behind all tickets:
+
+- the learner must **see translated labels**
+- the learner must **type and search in the visible language**
+- the system must still **run the same business logic regardless of language**
+
+So the rule is:
+
+> **Display localized text, but keep logic on canonical keys/IDs.**
+
+That is the most important architectural principle.
+
+### Generic End-to-End Flow
+
+```text
+                ┌────────────────────────────┐
+                │ Source taxonomy / metadata │
+                │  industries, skills, etc.  │
+                └──────────────┬─────────────┘
+                               │
+                               ▼
+                ┌────────────────────────────┐
+                │ Normalize to canonical key │
+                │  e.g. industry_code=fintech│
+                └──────────────┬─────────────┘
+                               │
+                               ├─────────────────────────────┐
+                               │                             │
+                               ▼                             ▼
+              ┌───────────────────────────┐   ┌───────────────────────────┐
+              │ Base entity / facet value │   │ Translation table         │
+              │ stores canonical identity │   │ stores per-locale labels  │
+              └──────────────┬────────────┘   └──────────────┬────────────┘
+                             │                               │
+                             └──────────────┬────────────────┘
+                                            │
+                                            ▼
+                         ┌───────────────────────────────────────┐
+                         │ Index builder creates localized       │
+                         │ Algolia documents / facet values      │
+                         └──────────────────┬────────────────────┘
+                                            │
+                                            ▼
+                         ┌───────────────────────────────────────┐
+                         │ Algolia returns localized label       │
+                         │ plus canonical id/code               │
+                         └──────────────────┬────────────────────┘
+                                            │
+                                            ▼
+                         ┌───────────────────────────────────────┐
+                         │ Frontend shows translated dropdown    │
+                         │ but stores selected canonical id      │
+                         └───────────────────────────────────────┘
+```
+
+### Generic Operating Model for Future Tickets
+
+For each new translation ticket, classify the field first:
+
+| Type | Example | Best solution |
+|---|---|---|
+| Static UI string | `Industry`, `Find an industry...` | Frontend `defineMessages` |
+| Closed vocabulary | `Introductory`, `Advanced` | Shared message lookup |
+| Semi-dynamic taxonomy | `Industries`, `Subjects` | DB translation table + Algolia localized indexing |
+| Fully dynamic taxonomy | `Skills`, `Job titles` | Canonical ID + translation cache + localized Algolia indexing |
+
+This classification prevents over-engineering and makes new tickets predictable.
+
+---
+
+## 9. Efficient Backend-Centric Translation Model
+
+If many translation tickets are expected, the most efficient long-term design is to make the database the **source of truth for dynamic translated labels**.
+
+### Recommended efficient solution
+
+Use a single normalized backend translation framework with four rules:
+
+1. **Static UI strings remain in frontend i18n catalogs**
+  - labels, placeholders, helper text, and aria labels
+2. **Dynamic filter values are stored in backend translation tables**
+  - industries, skills, subjects, job titles, and abilities
+3. **Business logic always uses canonical keys**
+  - never localized display labels
+4. **Algolia is only the localized search projection layer**
+  - not the source of truth for translations
+
+This is the lowest total-cost model when many translation tickets across 20+ locales are expected.
+
+### Recommended schema pattern
+
+Use a normalized design rather than storing translated strings ad hoc in many places.
+
+#### A. Canonical facet value table
+
+```python
+class FacetValue(models.Model):
+    """
+    Stores the stable identity of a filter value.
+    Example rows:
+      facet_type='industry', canonical_key='fintech'
+      facet_type='skill',    canonical_key='machine-learning'
+      facet_type='subject',  canonical_key='computer-science'
+    """
+    facet_type = models.CharField(max_length=50, db_index=True)
+    canonical_key = models.CharField(max_length=255, db_index=True)
+    source_value = models.CharField(max_length=500)
+    source_system = models.CharField(max_length=50, default='discovery')
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        unique_together = ('facet_type', 'canonical_key')
+```
+
+#### B. Localized label table
+
+```python
+class FacetValueTranslation(models.Model):
+    """
+    Stores one label per locale per canonical facet value.
+    """
+    facet_value = models.ForeignKey(FacetValue, on_delete=models.CASCADE, related_name='translations')
+    language_code = models.CharField(max_length=10, db_index=True)
+    display_value = models.CharField(max_length=500)
+    normalized_display_value = models.CharField(max_length=500, db_index=True)
+    translation_source = models.CharField(max_length=20, default='ai')
+    review_status = models.CharField(max_length=20, default='approved')
+    checksum = models.CharField(max_length=64, blank=True, null=True)
+
+    class Meta:
+        unique_together = ('facet_value', 'language_code')
+```
+
+#### C. Optional sync / job tracking table
+
+```python
+class TranslationSyncJob(models.Model):
+    job_type = models.CharField(max_length=50)
+    language_code = models.CharField(max_length=10)
+    status = models.CharField(max_length=20)
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    stats = models.JSONField(default=dict)
+```
+
+### Why this model is efficient
+
+Because it translates each canonical value **once per language**, not once per course or once per request.
+
+Example:
+
+```text
+Industry = fintech
+
+Translate once:
+  en → Financial Technology
+  es → Tecnología financiera
+  fr → Technologie financière
+
+Reuse that everywhere:
+  Skills Quiz
+  Search page
+  Recommendations
+  Analytics filters
+  Admin reports
+```
+
+### Recommended indexing contract for Algolia
+
+Each indexed record should contain both the stable key and the localized label.
+
+```json
+{
+  "industry": {
+    "key": "fintech",
+    "label": "Tecnología financiera"
+  },
+  "metadata_language": "es"
+}
+```
+
+Or for list facets:
+
+```json
+{
+  "industries": [
+    { "key": "fintech", "label": "Tecnología financiera" },
+    { "key": "healthcare", "label": "Atención médica" }
+  ],
+  "metadata_language": "es"
+}
+```
+
+If Algolia facet limitations require primitive strings for faceting, then index both:
+
+```json
+{
+  "industry_keys": ["fintech", "healthcare"],
+  "industry_labels": ["Tecnología financiera", "Atención médica"],
+  "metadata_language": "es"
+}
+```
+
+or a denormalized pair form appropriate for the query library in use.
+
+### Golden rule for logic safety
+
+Business logic must never depend on translated labels.
+
+Bad:
+
+```text
+if selectedIndustry == "Healthcare":
+```
+
+Good:
+
+```text
+if selectedIndustryKey == "healthcare":
+```
+
+That is what guarantees:
+
+- no regression in recommendation logic
+- no language-coupled bugs
+- no broken analytics when UI language changes
+
+### Generic backend flowchart
+
+```text
+            ┌─────────────────────────────────────┐
+            │ New source values arrive            │
+            │ (industry / skill / subject / etc.) │
+            └──────────────────┬──────────────────┘
+                               │
+                               ▼
+            ┌─────────────────────────────────────┐
+            │ Normalize to canonical keys         │
+            │ e.g. "Financial Technology"        │
+            │  -> "fintech"                      │
+            └──────────────────┬──────────────────┘
+                               │
+                               ▼
+            ┌─────────────────────────────────────┐
+            │ Upsert into FacetValue              │
+            └──────────────────┬──────────────────┘
+                               │
+                               ▼
+            ┌─────────────────────────────────────┐
+            │ For each supported locale           │
+            │ check FacetValueTranslation         │
+            └──────────────────┬──────────────────┘
+                               │
+                  ┌────────────┴────────────┐
+                  │                         │
+                  ▼                         ▼
+        translation exists          translation missing
+                  │                         │
+                  │                         ▼
+                  │            ┌──────────────────────────────┐
+                  │            │ Batch translate missing keys │
+                  │            └──────────────┬───────────────┘
+                  │                           │
+                  └──────────────┬────────────┘
+                                 │
+                                 ▼
+            ┌─────────────────────────────────────┐
+            │ Build localized Algolia objects     │
+            └──────────────────┬──────────────────┘
+                               │
+                               ▼
+            ┌─────────────────────────────────────┐
+            │ Frontend queries locale-aware data  │
+            └─────────────────────────────────────┘
+```
+
+### Recommended service boundaries
+
+To keep this generic, create services/modules like:
+
+- `FacetNormalizationService`
+- `FacetTranslationService`
+- `LocalizedIndexBuilder`
+- `LocaleAwareSearchConfigService`
+
+That way each new ticket becomes configuration, not reinvention.
+
+---
+
+## 10. Industry Filter Example — Skills Quiz
+
+This is the concrete example for the ticket:
+
+> Within skills quiz, the Industry filter label, placeholder, and industry options are not translated.
+
+### What belongs to which layer
+
+| Item | Type | Correct implementation |
+|---|---|---|
+| `Industry` label | Static UI text | Frontend i18n message |
+| `Find an industry...` placeholder | Static UI text | Frontend i18n message |
+| Industry option values | Dynamic taxonomy data | Locale-aware Algolia data from DB-backed translations |
+| Selected industry behavior | Business logic | Use canonical industry key/ID |
+
+### AS-IS vs TO-BE for Industry
+
+```text
+AS-IS
+-----
+Frontend language = Spanish
+  ├─ label still says "Industry"
+  ├─ placeholder still says "Find an industry..."
+  ├─ options still say "Healthcare", "Technology"
+  └─ logic probably depends on raw Algolia label text
+
+TO-BE
+-----
+Frontend language = Spanish
+  ├─ label says "Industria"
+  ├─ placeholder says "Buscar una industria..."
+  ├─ options say "Atención médica", "Tecnología"
+  └─ selection stores canonical key such as healthcare / technology
+```
+
+### Recommended frontend contract for Industry filter
+
+```ts
+type LocalizedFacetOption = {
+  key: string;          // canonical business key, e.g. "healthcare"
+  label: string;        // localized UI label, e.g. "Atención médica"
+  locale: string;       // e.g. "es"
+};
+```
+
+The dropdown should render `label`, but the selection handler should persist `key`.
+
+### Skills Quiz flowchart
+
+```text
+Learner opens Skills Quiz
+          │
+          ▼
+Frontend reads active locale
+          │
+          ▼
+Locale-aware search config resolves Algolia query
+          │
+          ├─ English -> request EN data
+          └─ Spanish -> request ES data
+          │
+          ▼
+Dropdown receives industry options
+  [{ key: "healthcare", label: "Atención médica" }, ...]
+          │
+          ▼
+Learner types "aten"
+          │
+          ▼
+Algolia filters against Spanish labels
+          │
+          ▼
+Learner selects "Atención médica"
+          │
+          ▼
+Frontend stores selected key = "healthcare"
+          │
+          ▼
+Quiz logic / recommendation engine uses key = "healthcare"
+          │
+          ▼
+No change in recommendation logic, only display language changed
+```
+
+### Technical implementation checklist for Industry ticket
+
+#### Frontend
+
+In `frontend-app-skills`:
+
+1. Add static messages for:
+   - `Industry`
+   - `Find an industry...`
+2. Ensure the filter component receives `locale`
+3. Ensure the dropdown renders localized `label`
+4. Ensure the selected value passed to state/actions is the canonical `key`
+5. Ensure autosuggest search matches localized labels
+
+#### Backend / Search source
+
+1. Introduce industry canonical keys if they do not already exist
+2. Store per-locale industry labels in translation table
+3. Publish localized industry labels into Algolia
+4. Add locale-aware routing:
+   - either `metadata_language=<locale>` on a shared index
+   - or locale-specific index aliases
+5. Keep logic based on keys, not labels
+
+### Best-practice recommendation for all future filter tickets
+
+If there are many similar translation tickets coming, do **not** solve them one-by-one with hardcoded patches.
+
+Instead, implement a shared pattern:
+
+```text
+Shared Filter Translation Framework
+  ├─ canonical key service
+  ├─ translation table
+  ├─ locale-aware Algolia query builder
+  ├─ shared dropdown contract: { key, label }
+  └─ static UI string message catalogs
+```
+
+Once that framework exists, each new ticket becomes:
+
+```text
+Add new facet type
+  → define canonical keys
+  → load translations
+  → index localized labels
+  → render with shared dropdown
+```
+
+That is the most efficient path if translation work will continue across multiple features and multiple languages.
 
 ---
 
