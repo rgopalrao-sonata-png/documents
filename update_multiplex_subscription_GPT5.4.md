@@ -1454,8 +1454,6 @@ Current expiration processing may still move the learner to **Audit** because it
 
 ### Diagram: Current vs Desired Behavior
 
-## Multi-License Expiry Behavior (Verified vs Audit)
-
 ```mermaid
 flowchart LR
     subgraph CURRENT["Current System Behavior"]
@@ -1472,6 +1470,9 @@ flowchart LR
         B4 -->|Yes| B5["Keep learner in Verified<br/>No downgrade"]
         B4 -->|No| B6["Downgrade Verified -> Audit"]
     end
+
+  ```
+
 ### The Gap
 
 `selectBestLicense` (latest expiry first) ensures **new enrollments** use the longest-lived license. It does **not** protect learners enrolled *before* the multi-license feature was active (i.e., already enrolled under License A before License B existed).
