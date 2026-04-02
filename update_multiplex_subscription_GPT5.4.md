@@ -1443,7 +1443,33 @@ export function shouldUpgradeUserEnrollment({
 
 > **Context:** ECS raised: "If a learner enrolled under License A, but License A is expiring and License B continues — will they stay in verified mode?"
 > Per license-manager source, expiration processing moves enrollments to audit for all licenses on the expiring plan, **regardless of whether another active license covers the same course.**
+If a learner has two licenses for the same course:
 
+- **License A** is expiring now
+- **License B** is still active
+
+Current expiration processing may still move the learner to **Audit** because it processes enrollments under the expiring plan first, without checking if another active license still covers the same learner + course.
+
+---
+
+### Diagram: Current vs Desired Behavior
+
+```mermaid
+flowchart LR
+    subgraph CURRENT[Current System Behavior]
+        A1["Learner has:\nLicense A = expiring\nLicense B = still active\nSame course"] --> A2["Expiry job runs for License A"]
+        A2 --> A3["Find enrollments tied to License A"]
+        A3 --> A4["Downgrade all found enrollments\nVerified -> Audit"]
+        A4 --> A5["Result:\nLearner moved to Audit\n(even though License B is active)"]
+    end
+
+    subgraph DESIRED[Desired/Future Safe Behavior]
+        B1["Learner has:\nLicense A = expiring\nLicense B = still active\nSame course"] --> B2["Expiry job runs for License A"]
+        B2 --> B3["Before downgrade, check:\nAny other active license for same learner + course?"]
+        B3 --> B4{"Active backup license exists?"}
+        B4 -->|Yes| B5["Keep learner in Verified\nNo downgrade"]
+        B4 -->|No| B6["Downgrade Verified -> Audit"]
+    end
 ### The Gap
 
 `selectBestLicense` (latest expiry first) ensures **new enrollments** use the longest-lived license. It does **not** protect learners enrolled *before* the multi-license feature was active (i.e., already enrolled under License A before License B existed).
