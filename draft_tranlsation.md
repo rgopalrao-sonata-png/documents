@@ -1097,6 +1097,98 @@ Once confirmed, apply the matching strategy from the Translation Classification 
 
 **Context:** `ContentTranslation` is keyed on `(content_metadata, language_code)` — one row per course per language. The existing fields cover prose content: `title`, `short_description`, `full_description`, `subtitle`, `outcome`, `prerequisites`. It does not currently store facet values.
 
+---
+
+#### Table Structure Overview
+
+```mermaid
+erDiagram
+    ContentMetadata {
+        int id PK
+        string content_key
+        json json_metadata
+    }
+
+    ContentTranslation {
+        int id PK
+        int content_metadata_id FK
+        string language_code
+        string title
+        string short_description
+        string full_description
+        string subtitle
+        string outcome
+        string prerequisites
+        string source_hash
+        json skill_names_translated "INTERIM ONLY — if no new table"
+        json subjects_translated "INTERIM ONLY — if no new table"
+    }
+
+    TranslatedFacetCache {
+        int id PK
+        string english_value "e.g. Python"
+        string field_type "skill or subject or ability"
+        string language_code "e.g. fr"
+        string translated_value "e.g. Apprentissage automatique"
+        string source "xpert_ai or human or google"
+    }
+
+    ContentMetadata ||--o{ ContentTranslation : "one row per (course x locale)"
+    TranslatedFacetCache }o--o{ ContentTranslation : "looked up at index time"
+```
+
+**Key difference in a single sentence:**
+- `ContentTranslation` — one row **per course per language** (bound to a specific course)
+- `TranslatedFacetCache` — one row **per unique word per language** (shared across all courses that use it)
+
+#### Why This Matters — The Duplication Problem
+
+```mermaid
+flowchart TB
+    subgraph CT["Option A — ContentTranslation Extension"]
+        direction TB
+        C1["Course 1 (fr) → skill_names: ['Python','ML']"]
+        C2["Course 2 (fr) → skill_names: ['Python','SQL']"]
+        C3["Course 3 (fr) → skill_names: ['Python','Java']"]
+        C4["Course 4 (fr) → skill_names: ['Python','NLP']"]
+        AI1["🤖 Xpert AI called for 'Python'\n× 4 times — once per course per locale"]
+        C1 --> AI1
+        C2 --> AI1
+        C3 --> AI1
+        C4 --> AI1
+        COST1["❌ 100K courses × 20 locales\n= 2,000,000 AI calls\n~500 MB JSON blobs"]
+        AI1 --> COST1
+    end
+
+    subgraph TFC["Option B — TranslatedFacetCache"]
+        direction TB
+        U1["Unique values collected:\n'Python', 'ML', 'SQL', 'Java', 'NLP'"]
+        AI2["🤖 Xpert AI called for 'Python'\n× 1 time per locale — ever"]
+        ROW["Single row in TranslatedFacetCache:\nenglish_value = 'Python'\nfield_type = 'skill'\nlanguage_code = 'fr'\ntranslated_value = 'Python'"]
+        REUSE["✅ All 10,000 courses that have 'Python'\nreuse this ONE row"]
+        U1 --> AI2 --> ROW --> REUSE
+        COST2["✅ 5K unique skills × 20 locales\n= 100,000 AI calls\n~5 MB storage"]
+        REUSE --> COST2
+    end
+
+    CT ~~~ TFC
+```
+
+#### Quick Reference — `ContentTranslation` vs `TranslatedFacetCache`
+
+| What | `ContentTranslation` extension | `TranslatedFacetCache` |
+|---|---|---|
+| Keyed on | `(course, language)` | `(english_value, field_type, language)` |
+| Stores | Translated prose + JSON arrays | One translated word/phrase |
+| AI calls at bootstrap | **2,000,000** | **100,000** |
+| Weekly incremental (100 new skills) | ~100,000/week | ~2,000/week |
+| Fix one wrong translation | Update 50–100 rows | **Update 1 row** |
+| Human override protected? | ❌ Overwritten next run | ✅ `source='human'` flag |
+| Storage at scale | ~500 MB | ~5 MB |
+| Add `Ability` facet later | New JSON field needed | New `field_type='ability'` value only |
+
+---
+
 #### Option A — Extend `ContentTranslation` (No New Table)
 
 Add `skill_names_translated = JSONField(null=True)` and `subjects_translated = JSONField(null=True)` to the existing model. One migration, zero new tables.
