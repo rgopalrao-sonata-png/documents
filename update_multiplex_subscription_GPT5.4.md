@@ -1521,12 +1521,14 @@ def remediate_enrollment_downgrades_for_expired_plan(self, expired_plan_uuid, en
     return {'remediated': remediated, 'expired_plan_uuid': expired_plan_uuid}
 ```
 
-**Kafka consumer:**
+**Proposed signal handler module (new file):**
 
 ```python
-# enterprise_access/apps/bffs/event_handlers.py
+# enterprise_access/apps/bffs/signals.py
 from openedx_events.enterprise.signals import SUBSCRIPTION_PLAN_EXPIRED
+from django.dispatch import receiver
 
+@receiver(SUBSCRIPTION_PLAN_EXPIRED)
 def handle_subscription_plan_expired(sender, signal, **kwargs):
     plan_data = kwargs.get('subscription_plan')
     if plan_data:
@@ -1535,8 +1537,9 @@ def handle_subscription_plan_expired(sender, signal, **kwargs):
             enterprise_customer_uuid=str(plan_data.enterprise_customer_uuid),
         )
 
-SUBSCRIPTION_PLAN_EXPIRED.connect(handle_subscription_plan_expired)
 ```
+
+**Note:** This repository already uses Django/openedx signal-handler patterns (for example in app-level `signals.py` modules). If true event-bus consumption is needed, it would typically be implemented via a management command pattern similar to `enterprise_access/apps/core/management/commands/consume_enterprise_ping_events.py`, not as a `bffs/event_handlers.py` module.
 
 ### Enrollment-Time vs Post-Expiration: Decision Matrix
 
@@ -1592,7 +1595,7 @@ To make the expiration-remediation design production-safe, the implementation sh
 | Phase | Scope | Action |
 |---|---|---|
 | 1 | BFF | `transform_licenses`, per-course mapping, `license_schema_version` |
-| 2 | BFF | Expiration remediation Celery task + Kafka consumer |
+| 2 | BFF | Expiration remediation Celery task + signal handler |
 | 3 | MFE data | `transformSubscriptionsData`, TypeScript types, cache patch |
 | 4 | MFE search | `useSearchCatalogs` — all catalog UUIDs |
 | 5 | MFE course | `getApplicableLicensesForCourse`, `selectBestLicense`, `shouldUpgradeUserEnrollment` |
@@ -1607,6 +1610,6 @@ To make the expiration-remediation design production-safe, the implementation sh
 ## Open Questions (v2 Addenda)
 
 5. **Remediation ownership**: Should re-upgrade logic live in `enterprise-access` or be a feature request to `license-manager` team to check for sibling licenses before downgrading?
-6. **Remediation timing**: Synchronous within expiration task, or async Celery after Kafka event? Async preferred for blast-radius containment.
+6. **Remediation timing**: Synchronous within expiration task, or async Celery after expiration signal/event? Async preferred for blast-radius containment.
 7. **Enrollment audit trail**: Should a record link the new license to the re-upgraded enrollment separately from the original expired license association?
 8. **Sidebar Summary Card UX**: With multi-license in different states, should the card show the most critical status (soonest expiry) or the best status (longest-lived)?
