@@ -1,1558 +1,1959 @@
-# Dynamic Data Translation Architecture
-## Skills, Subject, Level, Ability & Learning Type Filters — 20+ Language Support
-
-> **Author perspective:** Expert Architect  
-> **Scope:** End-to-end translation of search filter labels *and* dynamic Algolia facet values  
-> **Target:** 20+ supported locales  
-
----
-
-## Table of Contents
-
-1. [System Overview](#1-system-overview)
-2. [AS-IS Process — Current State](#2-as-is-process--current-state)
-   - [Data Flow Diagram (AS-IS)](#data-flow-diagram-as-is)
-   - [Layer-by-Layer Analysis](#layer-by-layer-analysis)
-   - [Gaps and Broken Surfaces](#gaps-and-broken-surfaces)
-3. [TO-BE Process — Target Architecture](#3-to-be-process--target-architecture)
-   - [Data Flow Diagram (TO-BE)](#data-flow-diagram-to-be)
-   - [Design Principles](#design-principles)
-   - [Translation Classification Matrix](#translation-classification-matrix)
-4. [Implementation Blueprint](#4-implementation-blueprint)
-   - [Layer 1: Filter Labels & Placeholders](#layer-1-filter-labels--placeholders-static-ui)
-   - [Layer 2: Closed-Set Facet Values](#layer-2-closed-set-facet-values-level-availability-learning-type)
-   - [Layer 3: Semi-Dynamic Facet Values](#layer-3-semi-dynamic-facet-values-subjects)
-   - [Layer 4: Fully Dynamic Facet Values](#layer-4-fully-dynamic-facet-values-skills--ability)
-   - [Layer 5: Frontend Locale Routing](#layer-5-frontend-locale-routing)
-   - [Layer 6: Backend Multi-Language Pipeline](#layer-6-backend-multi-language-pipeline)
-5. [Phased Delivery Plan](#5-phased-delivery-plan)
-6. [Repository Touchpoints](#6-repository-touchpoints)
-7. [ADRs — Architecture Decision Records](#7-adrs--architecture-decision-records)
-8. [Generic Reusable Solution for All Dynamic Filter Tickets](#8-generic-reusable-solution-for-all-dynamic-filter-tickets)
-9. [Efficient Backend-Centric Translation Model](#9-efficient-backend-centric-translation-model)
-10. [Industry Filter Example — Skills Quiz](#10-industry-filter-example--skills-quiz)
-
----
-
-## 1. System Overview
-
-The search page filters are powered by **Algolia** as the data backbone, delivered through the `@edx/frontend-enterprise-catalog-search` shared package, consumed by `frontend-app-learner-portal-enterprise`. The backend indexing pipeline lives in **enterprise-catalog**, which also partially exists in **course-discovery** for original field sourcing.
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    DATA ORIGIN LAYER                         │
-│  course-discovery DB ──► json_metadata (skills, subjects,    │
-│                           level_type, etc.)                  │
-└───────────────────────────────┬──────────────────────────────┘
-                                │
-┌───────────────────────────────▼──────────────────────────────┐
-│                 INDEXING PIPELINE LAYER                       │
-│  enterprise-catalog                                          │
-│  ├── algolia_utils.py     (field extraction + indexing)      │
-│  ├── ContentTranslation   (DB cache for translated fields)   │
-│  ├── translation_utils.py (Xpert AI translation calls)       │
-│  └── reindex_algolia cmd  (writes to Algolia)                │
-└───────────────────────────────┬──────────────────────────────┘
-                                │
-┌───────────────────────────────▼──────────────────────────────┐
-│                    ALGOLIA INDEX LAYER                        │
-│  Single index: both English + Spanish objects co-indexed     │
-│  Differentiated by: metadata_language field                  │
-│  Fields: skill_names, subjects, level_type, availability,    │
-│          content_type, partners.name, language               │
-└───────────────────────────────┬──────────────────────────────┘
-                                │
-┌───────────────────────────────▼──────────────────────────────┐
-│               SHARED PACKAGE LAYER                           │
-│  @edx/frontend-enterprise-catalog-search                     │
-│  ├── SEARCH_FACET_FILTERS constants  (filter definitions)    │
-│  ├── messages.js             (known-value i18n mappings)     │
-│  ├── FacetItem.jsx           (dropdown option rendering)     │
-│  ├── FacetDropdown.jsx       (filter title rendering)        │
-│  ├── TypeaheadFacetDropdown  (typeahead placeholder)         │
-│  ├── LearningTypeRadioFacet  (Learning Type only)            │
-│  └── CurrentRefinements      (active filter chips)           │
-└───────────────────────────────┬──────────────────────────────┘
-                                │
-┌───────────────────────────────▼──────────────────────────────┐
-│                   CONSUMER APP LAYER                         │
-│  frontend-app-learner-portal-enterprise                      │
-│  ├── SearchPage.jsx          (filter surface)                │
-│  ├── constants.js            (overrides SEARCH_FACET_FILTERS)│
-│  └── useAlgoliaSearch hook   (index selection, locale)       │
-└──────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 2. AS-IS Process — Current State
-
-### Data Flow Diagram (AS-IS)
-
-```mermaid
-flowchart TD
-    subgraph ORIGIN["📦 DATA ORIGIN — course-discovery"]
-        CD[(course-discovery DB)]
-        CD -->|"json_metadata skills, subjects, level_type — English only"| JM[json_metadata English only]
-    end
-
-    subgraph CATALOG["⚙️ INDEXING PIPELINE — enterprise-catalog"]
-        JM --> EN_OBJ["English Algolia Object\nobjectID: course-v1:edX+...\nmetadata_language: en\nskill_names: Machine Learning\nsubjects: Computer Science"]
-        JM --> XPERT["Xpert AI\ntranslate_skills_or_subjects\n⚠️ Called per course at index time\nSpanish ONLY"]
-        XPERT --> ES_OBJ["Spanish Algolia Object\nobjectID: course-v1:edX+...-es\nmetadata_language: es\nskill_names: Aprendizaje Automático"]
-    end
-
-    subgraph ALGOLIA["🔍 ALGOLIA INDEX — Single index, all languages mixed"]
-        EN_OBJ --> IDX[("Algolia Index\nEnglish + Spanish objects co-indexed")]
-        ES_OBJ --> IDX
-    end
-
-    subgraph PKG["📦 @edx/frontend-enterprise-catalog-search"]
-        FDD["FacetDropdown.jsx\n❌ title = raw string e.g. 'Skills'"]
-        FI["FacetItem.jsx\n✅ Level options translated\n❌ Skills/Subject NOT in messages.js"]
-        TYPH["TypeaheadFacetDropdown.jsx\n❌ placeholder = 'Find a skill...'"]
-        MSG["messages.js\n✅ Level, Availability, Language, Learning Type\n❌ Filter titles, Skills, Subjects MISSING"]
-    end
-
-    subgraph FRONTEND["🖥️ frontend-app-learner-portal-enterprise"]
-        HOOK["useAlgoliaSearch\n❌ No metadata_language filter\nShows ALL languages in facets"]
-        SP["SearchPage.jsx\nPasses raw English title strings"]
-    end
-
-    IDX -->|"Returns ALL language objects — no locale filter"| HOOK
-    HOOK --> SP
-    SP --> FDD & FI & TYPH
-    FDD & FI -.->|"lookup"| MSG
-
-    style CATALOG fill:#fff3e0,stroke:#FF9800
-    style ALGOLIA fill:#f3e5f5,stroke:#9C27B0
-    style PKG fill:#e8f5e9,stroke:#4CAF50
-    style FRONTEND fill:#fce4ec,stroke:#E91E63
-    style XPERT fill:#ffebee,stroke:#f44336
-```
-
-### Layer-by-Layer Analysis
-
-#### Backend — enterprise-catalog
-
-| Component | File | What it does | Translation state |
-|---|---|---|---|
-| `ContentTranslation` model | `models.py` L1886 | DB cache for pre-translated title, description, subtitle, outcome | ✅ Exists, **Spanish only** |
-| `populate_spanish_translations` | `management/commands/` | Runs Xpert AI to fill `ContentTranslation` table | ✅ Exists, **Spanish only** |
-| `create_spanish_algolia_object` | `algolia_utils.py` L1701 | Creates ES Algolia object from EN object | ✅ Exists, **Spanish only** |
-| `translate_skills_or_subjects` | `translation_utils.py` L133 | Calls Xpert AI at **index time** per item | ⚠️ Runtime AI call, slow, Spanish only |
-| `translate_facet_value` | `translation_utils.py` L97 | Dict lookup for closed-set values | ✅ Works, Spanish only |
-| Level translations | `algolia_utils.py` | `LEVEL_TYPE_TRANSLATIONS` dict | ✅ Spanish only |
-| `metadata_language` field | Algolia object | Differentiates EN vs ES objects | ⚠️ Not used by frontend |
-
-#### Frontend — `@edx/frontend-enterprise-catalog-search` package
-
-| Component | File | What it translates | What is missing |
-|---|---|---|---|
-| `LearningTypeRadioFacet.jsx` | Package src | All labels via `<FormattedMessage>` | ✅ Fully translated |
-| `FacetItem.jsx` | Package src | Dropdown options via `messages[item.label]` lookup | ❌ Skills/Subject values not in messages.js |
-| `CurrentRefinements.jsx` | Package src | Active filter chips via `messages[item.label]` lookup | ❌ Same gap |
-| `FacetDropdown.jsx` | Package src | Filter **title** via raw `{title}` prop | ❌ Not wrapped in intl |
-| `TypeaheadFacetDropdown.jsx` | Package src | Renders `options.placeholder` and `options.ariaLabel` | ❌ Not wrapped in intl |
-| `SearchFilters.jsx` | Package src | Passes raw `title` from constants to `FacetDropdown` | ❌ Source is a raw string |
-| `messages.js` | Package src | `defineMessages` for Level, Availability, Language, Learning Type | ❌ Missing: Skills, Subject, filter titles, placeholders |
-| `SEARCH_FACET_FILTERS` constants | `data/constants.js` | Static English strings for all filter definitions | ❌ Not intl-wrapped |
-
-#### Frontend — `frontend-app-learner-portal-enterprise`
-
-| Component | Issue |
-|---|---|
-| `useAlgoliaSearch` hook | Does not filter Algolia queries by `metadata_language` |
-| `constants.js` (SearchPage) | Overrides some SEARCH_FACET_FILTERS but still raw strings |
-| No locale → index routing | Frontend sends same query regardless of user locale |
-
----
-
-### Gaps and Broken Surfaces
-
-```
-Priority | Filter      | What's broken
-─────────┼─────────────┼──────────────────────────────────────────────────────
- HIGH    │ Skills      │ Title "Skills", placeholder "Find a skill..." — English
-         │             │ All option values — English (Algolia raw strings)
-         │             │ Frontend doesn't request locale-specific Algolia data
-─────────┼─────────────┼──────────────────────────────────────────────────────
- HIGH    │ Subject     │ Title "Subject", placeholder "Find a subject..." — English
-         │             │ All option values — English (Algolia raw strings)
-─────────┼─────────────┼──────────────────────────────────────────────────────
- MEDIUM  │ Level       │ Title "Level" — English
-         │             │ Option values ARE translated via messages.js ✅
-─────────┼─────────────┼──────────────────────────────────────────────────────
- MEDIUM  │ Learning    │ Fully translated in LearningTypeRadioFacet ✅
-         │ Type        │ But content_type values in Algolia still English
-─────────┼─────────────┼──────────────────────────────────────────────────────
- LOW     │ Availability│ Option values translated ✅; title "Availability" not ✅
-─────────┼─────────────┼──────────────────────────────────────────────────────
- UNCLEAR │ Ability     │ Not present in SEARCH_FACET_FILTERS in the package
-         │             │ May be a consuming-app local filter — needs confirmation
-─────────┼─────────────┼──────────────────────────────────────────────────────
- ALL     │ 19 missing  │ Translation pipeline is Spanish-ONLY
-         │ locales     │ No architecture for 20+ languages
-```
-
----
-
-## 3. TO-BE Process — Target Architecture
-
-### Data Flow Diagram (TO-BE)
-
-```mermaid
-flowchart TD
-    subgraph ORIGIN["📦 DATA ORIGIN — course-discovery"]
-        CD[(course-discovery DB)]
-        CD -->|"English json_metadata"| JM[json_metadata]
-    end
-
-    subgraph CACHE["🗄️ NEW: Translation Tables"]
-        TFC["TranslatedFacetCache\nenglish_value + field_type + language_code → translated_value\nOne entry per unique value per locale"]
-        CT["ContentTranslation\ncontent_key + language_code → title, description\nGeneralized from Spanish-only"]
-    end
-
-    subgraph PIPELINE["⚙️ INDEXING PIPELINE — enterprise-catalog"]
-        JM --> CMD["populate_translations cmd\nWeekly cron\n1. Collect unique skills and subjects\n2. Check cache for misses\n3. Batch Xpert AI for misses only\n4. Write to TranslatedFacetCache"]
-        CMD -->|"cache misses only"| XPERT_BATCH["Xpert AI\nBatch 50 items per call\n20 locales × unique values"]
-        XPERT_BATCH -->|"write results"| TFC
-        TFC --> INDEXER["create_localized_algolia_object\nlanguage_code = fr / ar / zh / de ..."]
-        CT --> INDEXER
-        JM --> INDEXER
-        INDEXER --> ALGOLIA_OBJ["20 Locale Algolia Objects per course\nobjectID: course-...-fr  metadata_language: fr\nsubjects: Informatique\nskill_names: Apprentissage automatique"]
-    end
-
-    subgraph ALGOLIA["🔍 ALGOLIA — Single index, 20 locales co-indexed"]
-        ALGOLIA_OBJ --> IDX[("Algolia Index\nDifferentiated by metadata_language")]
-    end
-
-    subgraph PKG["📦 @edx/frontend-enterprise-catalog-search — UPDATED"]
-        MSG2["messages.js\n✅ Filter titles + placeholders + subjects\nPushed to openedx-translations"]
-        FDD2["FacetDropdown.jsx\n✅ intl.formatMessage for title"]
-        FI2["FacetItem.jsx — UNCHANGED\n✅ Skills pre-translated from Algolia\n✅ Subjects now in messages.js"]
-    end
-
-    subgraph FRONTEND["🖥️ frontend-app-learner-portal-enterprise — UPDATED"]
-        HOOK2["useAlgoliaSearch\n✅ resolveAlgoliaLocale\n✅ baseFilter = metadata_language: fr"]
-        SP2["SearchPage.jsx\nConfigure filters = baseFilter"]
-    end
-
-    IDX -->|"Returns ONLY fr objects when locale=fr"| HOOK2
-    HOOK2 --> SP2 --> FDD2 & FI2
-    FDD2 & FI2 -.->|"lookup"| MSG2
-
-    style CACHE fill:#e3f2fd,stroke:#1565C0,stroke-width:2px
-    style PIPELINE fill:#fff3e0,stroke:#FF9800
-    style ALGOLIA fill:#f3e5f5,stroke:#9C27B0
-    style PKG fill:#e8f5e9,stroke:#4CAF50
-    style FRONTEND fill:#fce4ec,stroke:#E91E63
-```
-
-### Design Principles
-
-1. **Translate at index time, not render time** — All dynamic values (skills, subjects) must be pre-translated before being written to Algolia. Never call a translation API at request time.
-2. **Single Algolia index, language-differentiated objects** — Avoids Algolia plan overages and simplifies management. Objects differentiated by `metadata_language` field + `-{locale}` objectID suffix.
-3. **Translation cache is the single source of truth** — A `TranslatedFacetCache` table prevents re-translating the same skill or subject across thousands of courses.
-4. **Finite sets use static message files** — Level, Availability, Learning Type option values are hardcoded sets and should use `defineMessages` in the shared package. No backend work needed.
-5. **Dynamic sets use pre-indexed translated values** — Skills and subjects come from Algolia already translated. The frontend simply renders what Algolia returns.
-6. **UI strings (titles, placeholders) belong to the frontend package** — These are not data; they are UI chrome and must be wrapped in `defineMessages` / `FormattedMessage`.
-7. **Degrade gracefully** — If a translation is missing for a locale, fall back to English. Never show a blank.
-
----
-
-### Translation Classification Matrix
-
-| Filter | Value source | Cardinality | Change frequency | Translation strategy |
-|---|---|---|---|---|
-| **Filter title** (e.g. "Skills") | `constants.js` static string | ~10 titles | Rarely | `defineMessages` in shared package |
-| **Placeholder** (e.g. "Find a skill...") | `constants.js` static string | ~10 strings | Rarely | `defineMessages` in shared package |
-| **Level** options | Algolia, fixed set: 3 values | 3 | Never | `messages.js` static lookup |
-| **Availability** options | Algolia, fixed set: 4 values | 4 | Never | `messages.js` static lookup |
-| **Learning Type** options | Component-hardcoded | 4–5 | Rarely | `<FormattedMessage>` (already done ✅) |
-| **Subject** options | Algolia, semi-static | ~50–100 | Quarterly | `messages.js` static lookup (Phase 2) + pre-indexed (Phase 4) |
-| **Skills** options | Algolia, fully dynamic | 5,000–50,000 | Weekly | Pre-indexed translated values from `TranslatedFacetCache` (Phase 4) |
-| **Ability** options | TBD — confirm source | TBD | TBD | Identify first; apply matching strategy |
-
-**Classification decision tree:**
-
-```mermaid
-flowchart LR
-    Q1{{"Is it a UI label\nor placeholder?"}}
-    Q2{{"Fixed small set?\nIntroductory, Available Now"}}
-    Q3{{"Stable enumerable?\nSubjects: up to 100"}}
-    Q4{{"Fully dynamic?\nSkills: 5k-50k"}}
-
-    S1["Strategy 1\n🔤 defineMessages\nFacetDropdown.jsx\nTypeaheadFacetDropdown.jsx"]
-    S2["Strategy 2\n📋 messages.js lookup\nFacetItem.jsx already works\n✅ Level / Availability done"]
-    S3["Strategy 3\n📖 Enumerate → messages.js\nPush to openedx-translations\nPhase 2"]
-    S4["Strategy 4\n🤖 AI pre-index\nTranslatedFacetCache\ncreate_localized_algolia_object\nPhase 3"]
-
-    Q1 -->|Yes| S1
-    Q1 -->|No| Q2
-    Q2 -->|Yes| S2
-    Q2 -->|No| Q3
-    Q3 -->|Yes| S3
-    Q3 -->|No| Q4
-    Q4 -->|Yes| S4
-
-    style S1 fill:#e8f5e9,stroke:#388E3C
-    style S2 fill:#e3f2fd,stroke:#1565C0
-    style S3 fill:#fff3e0,stroke:#F57C00
-    style S4 fill:#fce4ec,stroke:#C62828
-```
-
----
-
-## 4. Implementation Blueprint
-
-### Layer 1: Filter Labels & Placeholders (Static UI)
-
-**Repo:** `openedx/frontend-enterprise` → `packages/catalog-search/src`
-
-**Problem:** `SEARCH_FACET_FILTERS` in `data/constants.js` stores `title` and `typeaheadOptions.placeholder` as raw English strings. `FacetDropdown.jsx` renders `{title}` directly. `TypeaheadFacetDropdown.jsx` renders `options.placeholder` directly.
-
-**Solution:**
-
-**Step 1 — Add new entries to `messages.js`:**
-
-```js
-// packages/catalog-search/src/messages.js  (additions)
-import { defineMessages } from '@edx/frontend-platform/i18n';
-
-const messages = defineMessages({
-  // === EXISTING (already present) ===
-  // Level, Availability, Language, Learning Type options...
-
-  // === NEW: Filter titles ===
-  'filter.title.skills': {
-    id: 'search.facetFilters.title.skills',
-    defaultMessage: 'Skills',
-    description: 'Label for the Skills filter dropdown',
-  },
-  'filter.title.subject': {
-    id: 'search.facetFilters.title.subject',
-    defaultMessage: 'Subject',
-    description: 'Label for the Subject filter dropdown',
-  },
-  'filter.title.level': {
-    id: 'search.facetFilters.title.level',
-    defaultMessage: 'Level',
-    description: 'Label for the Level filter dropdown',
-  },
-  'filter.title.partner': {
-    id: 'search.facetFilters.title.partner',
-    defaultMessage: 'Partner',
-    description: 'Label for the Partner filter dropdown',
-  },
-  'filter.title.availability': {
-    id: 'search.facetFilters.title.availability',
-    defaultMessage: 'Availability',
-    description: 'Label for the Availability filter dropdown',
-  },
-
-  // === NEW: Typeahead placeholders ===
-  'filter.placeholder.skills': {
-    id: 'search.facetFilters.placeholder.skills',
-    defaultMessage: 'Find a skill...',
-    description: 'Placeholder text for the Skills typeahead filter',
-  },
-  'filter.placeholder.subject': {
-    id: 'search.facetFilters.placeholder.subject',
-    defaultMessage: 'Find a subject...',
-    description: 'Placeholder text for the Subject typeahead filter',
-  },
-  'filter.ariaLabel.skills': {
-    id: 'search.facetFilters.ariaLabel.skills',
-    defaultMessage: 'Type to find a skill',
-    description: 'Aria label for the Skills typeahead input',
-  },
-  'filter.ariaLabel.subject': {
-    id: 'search.facetFilters.ariaLabel.subject',
-    defaultMessage: 'Type to find a subject',
-    description: 'Aria label for the Subject typeahead input',
-  },
-});
-```
-
-**Step 2 — Update `data/constants.js` to use message keys instead of raw strings:**
-
-```js
-// data/constants.js — each filter definition now carries a messageKey
-export const SEARCH_FACET_FILTERS = [
-  {
-    attribute: 'skill_names',
-    title: 'Skills',                    // kept for backward compat
-    titleMessageKey: 'filter.title.skills',
-    typeaheadOptions: {
-      placeholder: 'Find a skill...',   // kept for backward compat
-      placeholderMessageKey: 'filter.placeholder.skills',
-      ariaLabel: 'Type to find a skill',
-      ariaLabelMessageKey: 'filter.ariaLabel.skills',
-      minLength: 3,
-    },
-  },
-  // ... other filters follow same pattern
-];
-```
-
-**Step 3 — Update `FacetDropdown.jsx` to resolve the message key:**
-
-```jsx
-// FacetDropdown.jsx
-import { useIntl } from '@edx/frontend-platform/i18n';
-import messages from './messages';
-
-const FacetDropdown = ({ title, titleMessageKey, items, ... }) => {
-  const intl = useIntl();
-  const resolvedTitle = titleMessageKey && messages[titleMessageKey]
-    ? intl.formatMessage(messages[titleMessageKey])
-    : title; // fallback to raw string for backward compat
-
-  return (
-    <div className="facet-list">
-      <Dropdown ...>
-        <Dropdown.Toggle ...>
-          {resolvedTitle}
-        </Dropdown.Toggle>
-        ...
-      </Dropdown>
-    </div>
-  );
-};
-```
-
-**Step 4 — Update `TypeaheadFacetDropdown.jsx` similarly:**
-
-```jsx
-const TypeaheadFacetDropdown = ({ title, titleMessageKey, options, ... }) => {
-  const intl = useIntl();
-  const resolvedPlaceholder = options.placeholderMessageKey && messages[options.placeholderMessageKey]
-    ? intl.formatMessage(messages[options.placeholderMessageKey])
-    : options.placeholder;
-
-  const resolvedAriaLabel = options.ariaLabelMessageKey && messages[options.ariaLabelMessageKey]
-    ? intl.formatMessage(messages[options.ariaLabelMessageKey])
-    : options.ariaLabel;
-
-  // pass resolvedPlaceholder and resolvedAriaLabel to Input
-};
-```
-
-**Step 5 — Extract strings and push to openedx-translations:**
-
-```bash
-# In frontend-enterprise repo
-npm run i18n_extract    # generates src/i18n/messages/en.json
-# Push to Transifex / openedx-translations for 20+ locale translation
-```
-
----
-
-### Layer 2: Closed-Set Facet Values (Level, Availability, Learning Type)
-
-**Status:** ✅ Largely done. `messages.js` already has Level, Availability, Language, Learning Type values.  
-**Remaining action:** Verify all currently used string values are covered and the `messages[item.label]` pattern in `FacetItem.jsx` and `CurrentRefinements.jsx` serves them correctly.
-
-**Validation checklist:**
-- `Introductory`, `Intermediate`, `Advanced` → present ✅
-- `Available Now`, `Upcoming`, `Starting Soon`, `Archived` → present ✅
-- `course`, `program`, `learnerpathway`, `video` → present ✅
-- Make sure all translations are published in `openedx-translations` `.json` files for each locale
-
-No new code changes needed in Layer 2 beyond ensuring completeness.
-
----
-
-### Layer 3: Semi-Dynamic Facet Values (Subjects)
-
-**Cardinality:** ~50–100 values. Changes quarterly when edX adds new subject areas.
-
-**Subjects are a finite known set.** This is the same approach already used for Level and Language.
-
-**Step 1 — Enumerate all active subject values from Algolia/course-discovery:**
-
-```bash
-# Run this against course-discovery DB or Algolia export
-python manage.py shell -c "
-from course_discovery.apps.course_metadata.models import Subject
-for s in Subject.objects.all().order_by('name'):
-    print(s.name)
-"
-```
-
-**Step 2 — Add all ~50 subject names to `messages.js`:**
-
-```js
-// messages.js additions
-'Computer Science': {
-  id: 'catalog.subject.computerScience',
-  defaultMessage: 'Computer Science',
-  description: 'Subject filter option: Computer Science',
-},
-'Business & Management': {
-  id: 'catalog.subject.businessManagement',
-  defaultMessage: 'Business & Management',
-  description: 'Subject filter option: Business & Management',
-},
-'Data Analysis & Statistics': {
-  id: 'catalog.subject.dataAnalysis',
-  defaultMessage: 'Data Analysis & Statistics',
-  description: 'Subject filter option: Data Analysis & Statistics',
-},
-// ... all remaining subjects
-```
-
-**Why this works:** `FacetItem.jsx` already does `messages[item.label] ? intl.formatMessage(...) : item.label`. Adding subject values to `messages.js` activates translation with zero component changes.
-
-**Step 3 — Push to openedx-translations for all 20 locales.**
-
-**Maintenance process:**  
-When a new subject is added to course-discovery, a PR must be raised to `frontend-enterprise` to add the new message ID. A CI lint rule can detect Algolia subjects not present in `messages.js` and flag as a warning.
-
----
-
-### Layer 4: Fully Dynamic Facet Values (Skills & Ability)
-
-This is the **hardest layer** and requires changes across backend and frontend.
-
-#### Problem Statement
-
-Algolia contains `skill_names` values like `"Machine Learning"`, `"Transformer Models"`, `"PyTorch"` — tens of thousands of dynamically growing English strings. The `messages.js` lookup approach cannot scale.
-
-The AS-IS backend already creates Spanish Algolia objects (`objectID = "...-es"`) but:
-- Only Spanish, not 20+ locales
-- `translate_skills_or_subjects()` calls Xpert AI at **indexing time** for each course — meaning the same skill `"Python"` is translated hundreds of times (once per course that has it)
-- No deduplication cache for facet values specifically
-- Frontend doesn't know to filter by `metadata_language`
-
-#### Solution Architecture
-
-**Sub-approach A: Add `TranslatedFacetCache` table (Backend)**
-
-```python
-# enterprise-catalog new model
-class TranslatedFacetCache(TimeStampedModel):
+import collections
+import copy
+import json
+from datetime import datetime
+from logging import getLogger
+from uuid import uuid4
+
+from config_models.models import ConfigurationModel
+from django.conf import settings
+from django.db import (
+    DatabaseError,
+    IntegrityError,
+    OperationalError,
+    models,
+    transaction,
+)
+from django.db.models import Q
+from django.utils.functional import cached_property
+from django.utils.translation import gettext as _
+from edx_rbac.models import UserRole, UserRoleAssignment
+from jsonfield.encoder import JSONEncoder
+from jsonfield.fields import JSONField
+from model_utils.models import TimeStampedModel
+from simple_history.models import HistoricalRecords
+
+from enterprise_catalog.apps.api.v1.utils import (
+    get_enterprise_utm_context,
+    get_most_recent_modified_time,
+    update_query_parameters,
+)
+from enterprise_catalog.apps.api_client.discovery import (
+    CatalogQueryMetadata,
+    DiscoveryApiClient,
+)
+from enterprise_catalog.apps.api_client.enterprise_cache import (
+    EnterpriseCustomerDetails,
+)
+from enterprise_catalog.apps.catalog.constants import (
+    ACCESS_TO_ALL_ENTERPRISES_TOKEN,
+    AGGREGATION_KEY_PREFIX,
+    CONTENT_COURSE_TYPE_ALLOW_LIST,
+    CONTENT_PRODUCT_SOURCE_ALLOW_LIST,
+    CONTENT_TYPE_CHOICES,
+    COURSE,
+    COURSE_RUN,
+    COURSE_RUN_RESTRICTION_TYPE_KEY,
+    EXEC_ED_2U_COURSE_TYPE,
+    EXEC_ED_2U_ENTITLEMENT_MODE,
+    PROGRAM,
+    QUERY_FOR_RESTRICTED_RUNS,
+    RESTRICTED_RUNS_ALLOWED_KEY,
+    json_serialized_course_modes,
+)
+from enterprise_catalog.apps.catalog.content_metadata_utils import (
+    get_advertised_course_run,
+    get_course_first_paid_enrollable_seat_price,
+)
+from enterprise_catalog.apps.catalog.utils import (
+    batch,
+    enterprise_proxy_login_url,
+    get_content_filter_hash,
+    get_content_key,
+    get_content_type,
+    get_content_uuid,
+    get_parent_content_key,
+    localized_utcnow,
+)
+
+
+LOGGER = getLogger(__name__)
+
+
+class CatalogQuery(TimeStampedModel):
     """
-    Cache for individual translated facet values across all content.
-    Prevents re-translating the same skill/subject dozens of times.
+    Stores a re-usable catalog query.
+
+    .. no_pii:
     """
-    english_value = models.CharField(max_length=500, db_index=True)
-    field_type = models.CharField(
-        max_length=50,
-        choices=[('skill', 'Skill'), ('subject', 'Subject'), ('ability', 'Ability')]
+
+    content_filter = JSONField(
+        blank=False,
+        null=False,
+        default=dict,
+        load_kwargs={'object_pairs_hook': collections.OrderedDict},
+        dump_kwargs={'indent': 4, 'cls': JSONEncoder, 'separators': (',', ':')},
+        help_text=_(
+            "Query parameters which will be used to filter the discovery service's search/all "
+            "endpoint results, specified as a JSON object."
+        )
     )
-    language_code = models.CharField(max_length=10)
-    translated_value = models.CharField(max_length=500)
-    source = models.CharField(
-        max_length=20,
-        default='xpert_ai',
-        help_text="Translation source: xpert_ai, human, google_translate"
+    content_filter_hash = models.CharField(
+        null=True,
+        max_length=32,
+        editable=False,
+        unique=True,
+    )
+
+    uuid = models.UUIDField(
+        unique=True,
+        default=uuid4,
+        editable=False,
+    )
+
+    title = models.CharField(
+        null=True,
+        unique=True,
+        max_length=100
     )
 
     class Meta:
-        unique_together = ('english_value', 'field_type', 'language_code')
-        indexes = [
-            models.Index(fields=['english_value', 'field_type', 'language_code']),
+        verbose_name = _("Catalog Query")
+        verbose_name_plural = _("Catalog Queries")
+        app_label = 'catalog'
+
+    def save(self, *args, **kwargs):
+        self.content_filter_hash = get_content_filter_hash(self.content_filter)
+        super().save(*args, **kwargs)
+
+    def pretty_print_content_filter(self):
+        """
+        Prints the content filter in an indented, more easily readable format.
+        """
+        return json.dumps(self.content_filter, indent=4)
+
+    @cached_property
+    def restricted_runs_allowed(self):
+        """
+        Return a dict of restricted course <-> run mappings by
+        course key, e.g.
+        ```
+        "edX+FUN": [
+            "course-v1:edX+FUN+3T2024"
         ]
-```
+        ```
+        """
+        mapping = self.content_filter.get(RESTRICTED_RUNS_ALLOWED_KEY)  # pylint: disable=no-member
+        if not mapping:
+            return None
+        if not isinstance(mapping, dict):
+            LOGGER.error('%s restricted runs value is not a dict', self)
+            return None
+        return {
+            course_key.removeprefix(AGGREGATION_KEY_PREFIX): course_run_list
+            for course_key, course_run_list in mapping.items()
+        }
 
-**Sub-approach B: Generalize `create_spanish_algolia_object` → `create_localized_algolia_object`**
+    @cached_property
+    def restricted_courses_by_run_key(self):
+        """
+        Returns a reverse mapping of self.restricted_runs_allowed, e.g.
+        ```
+        {
+            "course-v1:edX+FUN+3T2024": "edX+FUN",
+            "course-v1:edX+FUN+3T2025": "edX+FUN",
+            "course-v1:edX+GAMES+3T2024": "edX+GAMES",
+        }
+        ```
 
-```python
-# algolia_utils.py
-import copy  # required — add to module-level imports
+        Returns an empty dict if no restricted runs are allowed for this CatalogQuery.
+        """
+        if not self.restricted_runs_allowed:
+            return {}
 
-def create_localized_algolia_object(algolia_object, content_metadata, language_code):
+        restricted_courses_by_run = {}
+        for course_key, restricted_run_list in self.restricted_runs_allowed.items():
+            for run_key in restricted_run_list:
+                restricted_courses_by_run[run_key] = course_key
+        return restricted_courses_by_run
+
+    @classmethod
+    def get_by_uuid(cls, uuid):
+        try:
+            return cls.objects.get(uuid=uuid)
+        except cls.DoesNotExist:
+            return None
+
+    def __str__(self):
+        """
+        Return human-readable string representation.
+        """
+        return (
+            f"<CatalogQuery: ({self.id}) with content_filter_hash '{self.content_filter_hash}' "
+            f"and content_filter '{self.pretty_print_content_filter()}'>"
+        )
+
+    def short_str_for_listings(self):
+        """
+        Return *short* human-readable string representation for listings.
+        """
+        return (
+            f"<CatalogQuery: ({self.id}) with UUID '{self.uuid}'>"
+        )
+
+
+class EnterpriseCatalog(TimeStampedModel):
     """
-    Replaces create_spanish_algolia_object.
-    Supports any language_code from SUPPORTED_LOCALES.
+    Associates a stored catalog query with an enterprise customer.
+
+    .. no_pii:
     """
-    # 1. Fetch ContentTranslation for title/description
-    translation = content_metadata.translations.filter(
-        language_code=language_code
-    ).first()
 
-    if not translation:
-        return None  # No pre-computed translation → skip this locale
+    uuid = models.UUIDField(
+        primary_key=True,
+        default=uuid4,
+        editable=False,
+    )
+    title = models.CharField(
+        max_length=255,
+        blank=False,
+        null=False,
+    )
+    enterprise_uuid = models.UUIDField(
+        blank=False,
+        null=False,
+        db_index=True,
+    )
+    enterprise_name = models.CharField(
+        max_length=255,
+        blank=True,
+    )
+    catalog_query = models.ForeignKey(
+        CatalogQuery,
+        blank=False,
+        null=True,
+        related_name='enterprise_catalogs',
+        on_delete=models.deletion.SET_NULL,
+    )
+    enabled_course_modes = JSONField(
+        default=json_serialized_course_modes,
+        load_kwargs={'object_pairs_hook': collections.OrderedDict},
+        dump_kwargs={'indent': 4, 'cls': JSONEncoder, 'separators': (',', ':')},
+        help_text=_('Ordered list of enrollment modes which can be displayed to learners for course runs in'
+                    ' this catalog.'),
+    )
+    publish_audit_enrollment_urls = models.BooleanField(
+        default=False,
+        help_text=_(
+            "Specifies whether courses should be published with direct-to-audit enrollment URLs."
+        ),
+    )
 
-    # 2. Deep copy and apply translated text fields
-    localized_object = copy.deepcopy(algolia_object)
-    _apply_text_translation(localized_object, translation)
+    history = HistoricalRecords()
 
-    # 3. Translate facet values using TranslatedFacetCache
-    _translate_facet_values_from_cache(localized_object, language_code)
+    class Meta:
+        verbose_name = _("Enterprise Catalog")
+        verbose_name_plural = _("Enterprise Catalogs")
+        app_label = 'catalog'
 
-    # 4. Mark the object
-    localized_object['objectID']          = f"{algolia_object['objectID']}-{language_code}"
-    localized_object['metadata_language'] = language_code
+    def __str__(self):
+        """
+        Return human-readable string representation.
+        """
+        return (
+            "<EnterpriseCatalog with UUID '{uuid}' "
+            "for EnterpriseCustomer '{enterprise_uuid}'>".format(
+                uuid=self.uuid,
+                enterprise_uuid=self.enterprise_uuid
+            )
+        )
 
-    return localized_object
+    @property
+    def content_metadata(self):
+        """
+        Helper to retrieve the content metadata associated with the catalog.
+
+        Returns:
+            Queryset of ContentMetadata: The queryset of associated content metadata
+        """
+        if not self.catalog_query:
+            return ContentMetadata.objects.none()
+        return self.catalog_query.contentmetadata_set.prefetch_related(
+            'restricted_run_allowed_for_restricted_course'
+        ).filter(
+            # Exclude all restricted runs (heuristic is that a run is assumed
+            # restricted if it is mapped to a restricted course via
+            # RestrictedRunAllowedForRestrictedCourse).
+            restricted_run_allowed_for_restricted_course__isnull=True,
+        )
+
+    @property
+    def content_metadata_with_restricted(self):
+        """
+        Same as self.content_metadata, but dynamically replace course json_metadata
+        with the correct version containing restricted runs allowed by the current
+        catalog query.
+
+        The technique to dynamically override ContentMetadata.json_metadata is a
+        combination of two things:
+        1. This method setting the `restricted_course_metadata_for_catalog_query`
+           attribute in the queryset to get the correct RestrictedCourseMetadata, and
+        2. The ContentMetdata.json_metadata attribute being a property that
+           dynamically uses (1) or falls back to the stored value in _json_metadata.
+
+        Returns:
+            Queryset of ContentMetadata: Same as self.content_metadata, but courses may have augmented
+            json_metadata.
+        """
+        if not self.catalog_query:
+            return ContentMetadata.objects.none()
+        related_contentmetadata = self.catalog_query.contentmetadata_set
+        # Provide json_metadata overrides via dynamic attribute if any restricted runs are allowed.
+        if self.catalog_query.restricted_runs_allowed:
+            # FYI: prefetch causes a performance penalty by introducing a 2nd database query.
+            related_contentmetadata = related_contentmetadata.prefetch_restricted_overrides(
+                catalog_query=self.catalog_query,
+            )
+
+        return related_contentmetadata.all()
+
+    @cached_property
+    def restricted_runs_allowed(self):
+        return self.catalog_query.restricted_runs_allowed
+
+    @cached_property
+    def restricted_courses_by_run_key(self):
+        return self.catalog_query.restricted_courses_by_run_key
+
+    @cached_property
+    def enterprise_customer(self):
+        """
+        A cached (for the life of this EnterpriseCatalog instance) EnterpriseCustomerDetails instance
+        for this catalog's customer uuid.
+        """
+        return EnterpriseCustomerDetails(self.enterprise_uuid)
+
+    def get_catalog_content_diff(self, content_keys):
+        """
+        Generate a catalog diff based on a provided list of content keys and what currently exists with the catalog's
+        metadata.
+
+        Arguments:
+            content_keys: (list) A list of string content keys used to calculate the diff on the catalog.
+
+        Returns:
+            items_not_found: (list) A list of objects representing the content keys that were provided but not found
+                under the catalog.
+            items_not_included: (list) A list of objects representing the content keys not provided but were found under
+                the catalog.
+            items_found: (list) A list of objects representing content keys that were provided and found, paired with
+                most recent updated at timestamp.
+
+        A content key is considered contained within the catalog when:
+          - associated metadata contains the specified content key.
+          - associated metadata contains the specified content key as a parent (to handle when
+            a catalog only contains course runs but a course id is searched).
+          - associated metadata contains the specified content key in a nested course run (to
+            handle when a catalog only contains courses but a course run id is searched).
+        """
+        found_content_keys = set()
+        items_not_included = []
+        items_found = []
+        items_not_found = set()
+
+        # cannot determine if specified content keys are part of catalog when a catalog query doesn't exist.
+        if not self.catalog_query:
+            return [items_not_found], items_not_included, items_found
+
+        distinct_content_keys = set(content_keys)
+        for content in self.content_metadata.all().values('modified', 'content_key'):
+            content_key = content.get('content_key')
+            found_content_keys.add(content_key)
+            content_modified = get_most_recent_modified_time(
+                content.get('modified'), self.modified, self.enterprise_customer.last_modified_date
+            )
+            if content_key in distinct_content_keys:
+                items_found.append({
+                    "content_key": content_key,
+                    "date_updated": content_modified
+                })
+            else:
+                items_not_included.append({'content_key': content_key})
+
+        items_not_found = distinct_content_keys - found_content_keys
+        return [{'content_key': item} for item in items_not_found], items_not_included, items_found
+
+    def get_matching_content(self, content_keys, include_restricted=False):
+        """
+        Returns the set of content contained within this catalog that matches
+        any of the course keys, course run keys, or programs keys specified by
+        the given ``content_keys`` argument.
+
+        A content key is considered contained within the catalog when:
+          - any metadata associated with the catalog has an exact ``content_key`` value that is contained
+            in the provided ``content_keys`` list.
+          - any metadata associated with the catalog has a ``parent_content_key`` value that is contained
+            in the ``content_keys`` list (to handle cases when a catalog contains only
+            course runs, but course ids are provided in the ``content_keys`` argument).
+          - any metadata associated with the catalog has a nested course run with a ``key`` that is contained
+            in the ``content_keys`` list (to handle cases when a catalog contains only courses,
+            but course run keys are provided in the ``content_keys`` argument).
+        """
+        # We cannot determine which content keys are part of this catalog when the catalog
+        # query doesn't exist, or when no content keys are provided.
+        if not self.catalog_query or not content_keys:
+            return ContentMetadata.objects.none()
+
+        content_keys = set(content_keys)
+
+        # construct a query on the associated catalog's content metadata to return metadata
+        # where content_key and parent_content_key matches the specified content_keys to
+        # handle the following cases where the catalog:
+        #   - contains courses and the specified content_keys are course ids
+        #   - contains course runs and the specified content_keys are course ids
+        #   - contains course runs and the specified content_keys are course run ids
+        #   - contains programs and the specified content_keys are program ids
+        query = Q(content_key__in=content_keys) | Q(parent_content_key__in=content_keys)
+
+        # retrieve content metadata objects for the specified content keys to get a set of
+        # parent content keys, i.e. course ids associated with the specified content_keys
+        # (if any) to handle the following case:
+        #   - catalog contains courses and the specified content_keys are course run ids.
+        searched_metadata = ContentMetadata.objects.filter(content_key__in=content_keys)
+        if include_restricted and self.catalog_query.restricted_runs_allowed:
+            # Only hide restricted runs that are not allowed by the current catalog.
+            searched_metadata = searched_metadata.prefetch_related(
+                'restricted_run_allowed_for_restricted_course'
+            ).exclude(
+                # Find all restricted runs allowed by a RestrictedCourseMetadata related to the
+                # current CatalogQuery. Do NOT exclude those.
+                ~Q(restricted_run_allowed_for_restricted_course__course__catalog_query=self.catalog_query)
+                # Exclude all other restricted runs. A run is assumed of type restricted if it
+                # is related to at least one RestrictedRunAllowedForRestrictedCourse.
+                & Q(restricted_run_allowed_for_restricted_course__isnull=False)
+            )
+        else:
+            # Hide ALL restricted runs.
+            searched_metadata = searched_metadata.exclude(
+                restricted_run_allowed_for_restricted_course__isnull=False
+            )
+        parent_content_keys = {
+            metadata.parent_content_key
+            for metadata in searched_metadata
+            if metadata.parent_content_key
+        }
+        query |= Q(content_key__in=parent_content_keys)
+        if include_restricted:
+            return self.content_metadata_with_restricted.filter(query)
+        else:
+            return self.content_metadata.filter(query)
+
+    def contains_content_keys(self, content_keys, include_restricted=False):
+        """
+        Determines whether the given ``content_keys`` are part of the catalog.
+
+        Returns True if this catalog contains the courses, course runs, and/or programs specified by
+        the given content key(s), else False.
+
+        A content key is considered contained within the catalog when:
+          - any metadata associated with the catalog has an exact ``content_key`` value that is contained
+            in the provided ``content_keys`` list.
+          - any metadata associated with the catalog has a ``parent_content_key`` value that is contained
+            in the ``content_keys`` list (to handle cases when a catalog contains only
+            course runs, but course ids are provided in the ``content_keys`` argument).
+          - any metadata associated with the catalog has a nested course run with a ``key`` that is contained
+            in the ``content_keys`` list (to handle cases when a catalog contains only courses,
+            but course run keys are provided in the ``content_keys`` argument).
+        """
+        included_content = self.get_matching_content(content_keys, include_restricted=include_restricted)
+        return included_content.exists()
+
+    def filter_content_keys(self, content_keys, include_restricted=False):
+        """
+        Determines whether content_keys are part of the catalog.
+
+        Arguments:
+            content_keys: (set) A set of string content keys to be filtered based on the catalog.
+
+        Returns:
+            items_included: (set) A filtered set of content keys contained in the catalog.
+
+        This method handles the following scenarios:
+          - associated metadata contains the specified content key.
+          - associated metadata contains the specified content key as a parent (when a catalog only contains
+           course runs but a course id is searched).
+        """
+        # cannot determine if specified content keys are part of catalog when catalog
+        # query doesn't exist or no content keys are provided.
+        if not self.catalog_query or not content_keys:
+            return set()
+
+        content_keys = set(content_keys)
+
+        # construct a query on the associated catalog's content metadata to return metadata
+        # where content_key and parent_content_key matches the specified content_keys to
+        # handle the following cases where the catalog:
+        #   - contains courses and the specified content_keys are course ids
+        #   - contains course runs and the specified content_keys are course ids
+        query = Q(content_key__in=content_keys) | Q(parent_content_key__in=content_keys)
+
+        items_included = set()
+        if include_restricted:
+            accessible_metadata_qs = self.content_metadata_with_restricted
+        else:
+            accessible_metadata_qs = self.content_metadata
+        for content in accessible_metadata_qs.filter(query).all():
+            if content.content_key in content_keys:
+                items_included.add(content.content_key)
+            elif content.parent_content_key in content_keys:
+                items_included.add(content.parent_content_key)
+        return items_included
+
+    def get_content_enrollment_url(self, content_metadata):
+        """
+        Return an enrollment page url based on the catalog information for the given content metadata record.
+
+        If the enterprise customer's Learner Portal (LP) is enabled, the LP course page URL is returned.
+
+        Arguments:
+            content_metadata (ContentMetadata): The record for which an enrollment URL is returned.
+        Returns:
+            (str): Enterprise landing page URL OR Enterprise Learner Portal course page URL.
+        """
+        if content_metadata.content_type not in (COURSE, COURSE_RUN):
+            return None
+
+        content_key = content_metadata.content_key
+        parent_content_key = content_metadata.parent_content_key
+
+        if not content_key:
+            return None
+
+        params = get_enterprise_utm_context(self.enterprise_name)
+        if self.publish_audit_enrollment_urls:
+            params['audit'] = 'true'
+
+        can_enroll_with_learner_portal = self._can_enroll_via_learner_portal
+
+        if content_metadata.is_exec_ed_2u_course:
+            exec_ed_enroll_url, exec_ed_entitlement_sku = self._get_exec_ed_2u_enrollment_url(
+                content_metadata,
+                enterprise_slug=self.enterprise_customer.slug,
+                use_learner_portal=can_enroll_with_learner_portal,
+            )
+            if can_enroll_with_learner_portal:
+                return update_query_parameters(exec_ed_enroll_url, params)
+
+            if not exec_ed_entitlement_sku:
+                warning = 'No sku found for exec ed 2u course: %s in catalog %s'
+                LOGGER.warning(warning, content_metadata.content_key, self.uuid)
+                return None
+
+            params['sku'] = exec_ed_entitlement_sku
+            exec_ed_proxy_login_enrollment_url = enterprise_proxy_login_url(
+                self.enterprise_customer.slug,
+                next_url=update_query_parameters(exec_ed_enroll_url, params)
+            )
+            return exec_ed_proxy_login_enrollment_url
+        elif can_enroll_with_learner_portal:
+            course_key = content_key
+            if parent_content_key:
+                # If parent_content_key is truthy, we know this is a course run.
+                # We must add a `course_run_key` value to the query params,
+                # so that we can render the correct info in the learner portal course page,
+                # and so that the learner is enrolled
+                # in the intended course run.
+                course_key = parent_content_key
+                params['course_run_key'] = content_key
+            url = '{}/{}/course/{}'.format(
+                settings.ENTERPRISE_LEARNER_PORTAL_BASE_URL,
+                self.enterprise_customer.slug,
+                course_key
+            )
+        else:
+            # Catalog param only needed for legacy (non-learner-portal) enrollment URLs
+            params['catalog'] = self.uuid
+
+            course_run_key = content_key
+            if not parent_content_key:
+                if advertised_course_run := get_advertised_course_run(content_metadata.json_metadata):
+                    course_run_key = advertised_course_run['key']
+            url = '{}/enterprise/{}/course/{}/enroll/'.format(
+                settings.LMS_BASE_URL,
+                self.enterprise_uuid,
+                course_run_key,
+            )
+
+        return update_query_parameters(url, params)
+
+    def _get_exec_ed_2u_enrollment_url(self, content_metadata, enterprise_slug, use_learner_portal):
+        if use_learner_portal:
+            return (
+                f"{settings.ENTERPRISE_LEARNER_PORTAL_BASE_URL}/{enterprise_slug}/"
+                f"executive-education-2u/course/{content_metadata.content_key}",
+                None
+            )
+
+        entitlement_sku = None
+        for entitlement in content_metadata.json_metadata.get('entitlements', []):
+            if entitlement['mode'] == EXEC_ED_2U_ENTITLEMENT_MODE:
+                entitlement_sku = entitlement.get('sku')
+
+        return (
+            f"{settings.ECOMMERCE_BASE_URL}/executive-education-2u/checkout",
+            entitlement_sku,
+        )
+
+    @property
+    def _can_enroll_via_learner_portal(self):
+        """
+        Check whether the enterprise customer has the learner portal enabled.
+        """
+        if not self.enterprise_customer.learner_portal_enabled:
+            return False
+        return True
+
+    def get_xapi_activity_id(self, content_resource, content_key):
+        """
+        Return enterprise xAPI activity identifier with the catalog information
+        for the given content key.  Note that the xAPI activity identifier is a
+        well-formed IRI/URI but not necessarily a resolvable URL.
+
+        Arguments:
+            content_resource (str): The content resource to use in the URL (i.e., "course", "program")
+            content_key (str): The content key for the course to be displayed.
+
+        Returns:
+            (str): Enterprise landing page url.
+        """
+        if not content_key or not content_resource:
+            return None
+        xapi_activity_id = '{}/xapi/activities/{}/{}'.format(
+            settings.LMS_BASE_URL,
+            content_resource,
+            content_key,
+        )
+        return xapi_activity_id
 
 
-def _translate_facet_values_from_cache(obj, language_code):
+class ContentMetadataQuerySet(models.QuerySet):
     """
-    Translates skill_names and subjects from TranslatedFacetCache.
-    Falls back to English if cache entry missing (never blocks indexing).
+    Customer queryset for ContentMetadata providing convenience methods to augment the results.
     """
-    from enterprise_catalog.apps.catalog.models import TranslatedFacetCache
 
-    for field in ('skill_names', 'subjects'):
-        values = obj.get(field) or []
-        if not values:
+    def prefetch_restricted_overrides(self, catalog_query=None):
+        """
+        Augment this queryset by fetching "override" metadata if any exist for a given
+        CatalogQuery.  The `json_metadata` attribute of courses returned by this new
+        queryset will be overridden if a related RestrictedCourseMetadata exists.
+        """
+        # If catalog_query is None, look for the "canonical" RestrictedCourseMetadata
+        # object which has a NULL catalog_query.
+        catalog_query_filter = {'catalog_query': catalog_query} if catalog_query else {'catalog_query__isnull': True}
+        return self.prefetch_related(
+            models.Prefetch(
+                'restricted_courses',
+                queryset=RestrictedCourseMetadata.objects.filter(**catalog_query_filter),
+                to_attr='restricted_course_metadata_for_catalog_query',
+            )
+        )
+
+
+class ContentMetadataManager(models.Manager):
+    """
+    Customer manager for ContentMetadata that forces the `modified` field
+    to be updated during `bulk_update()`.
+    """
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        """
+        Updates the `modified` time of each object, and then
+        does the usual bulk update, with `modified` as also
+        a field to save.
+        """
+        last_modified = localized_utcnow()
+        for obj in objs:
+            obj.modified = last_modified
+        fields += ['modified']
+
+        super().bulk_update(objs, fields, batch_size=batch_size)
+
+
+class BaseContentMetadata(TimeStampedModel):
+    """
+    Common ContentMetadata fields.
+    """
+    class Meta:
+        abstract = True
+
+    content_uuid = models.UUIDField(
+        null=True,
+        blank=True,
+        max_length=32,
+        unique=False,
+        verbose_name='Content UUID',
+        help_text=_(
+            "The UUID that represents a piece of content. This value is usually a secondary identifier to content_key "
+            "in the enterprise environment."
+        )
+    )
+    content_key = models.CharField(
+        max_length=255,
+        blank=False,
+        null=False,
+        unique=True,
+        help_text=_(
+            "The key that represents a piece of content, such as a course, course run, or program."
+        )
+    )
+    content_type = models.CharField(
+        max_length=255,
+        choices=CONTENT_TYPE_CHOICES,
+        blank=False,
+        null=False,
+    )
+    parent_content_key = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        db_index=True,
+        help_text=_(
+            "The key represents this content's parent. For example for course_runs content their parent course key."
+        )
+    )
+    _json_metadata = JSONField(
+        default={},
+        blank=True,
+        null=True,
+        load_kwargs={'object_pairs_hook': collections.OrderedDict},
+        dump_kwargs={'indent': 4, 'cls': JSONEncoder, 'separators': (',', ':')},
+        db_column='json_metadata',
+        help_text=_(
+            "The metadata about a particular piece content as retrieved from the discovery service's search/all "
+            "endpoint results, specified as a JSON object."
+        )
+    )
+
+    objects = ContentMetadataManager()
+
+    @property
+    def is_exec_ed_2u_course(self):
+        return self.content_type == COURSE and self.json_metadata.get('course_type') == EXEC_ED_2U_COURSE_TYPE
+
+    @property
+    def aggregation_key(self):
+        return self.json_metadata.get('aggregation_key')
+
+    @classmethod
+    def recently_modified_records(cls, time_delta):
+        """
+        Returns the ContentMetadata records modified in the range(now - time_delta, now).
+        """
+        range_start = localized_utcnow() - time_delta
+        range_end = localized_utcnow()
+        return cls.objects.filter(
+            modified__range=(range_start, range_end),
+        )
+
+    @classmethod
+    def get_child_records(cls, content_metadata):
+        """
+        Returns all child records of the given ContentMetadata instance.
+        """
+        return cls.objects.filter(parent_content_key=content_metadata.content_key)
+
+    @property
+    def json_metadata(self):
+        return self._json_metadata
+
+    @json_metadata.setter
+    def json_metadata(self, new_json_metadata):
+        self._json_metadata = new_json_metadata
+
+    def __str__(self):
+        """
+        Return human-readable string representation.
+        """
+        return f"<{self.__class__.__name__} for '{self.content_key}'>"
+
+
+class ContentMetadata(BaseContentMetadata):
+    """
+    Stores the JSON metadata for a piece of content, such as a course, course run, or program.
+    The metadata is retrieved from the Discovery service /search/all endpoint.
+
+    .. no_pii:
+    """
+    class Meta:
+        verbose_name = _("Content Metadata")
+        verbose_name_plural = _("Content Metadata")
+        app_label = 'catalog'
+
+    # one course can be associated with many programs and one program can contain many courses.
+    associated_content_metadata = models.ManyToManyField('self', blank=True)
+
+    # one course can be part of many CatalogQueries and one CatalogQuery can contain many courses.
+    catalog_queries = models.ManyToManyField(CatalogQuery)
+
+    history = HistoricalRecords()
+
+    objects = ContentMetadataManager().from_queryset(ContentMetadataQuerySet)()
+
+    @property
+    def json_metadata(self):
+        """
+        Use the CatalogQuery-specific version of a course json_metadata if one exists
+        (potentially containing restricted runs allowed by that CatatlogQuery),
+        otherwise fall back to the standard unrestricted-only version.
+        """
+        restricted_course_metadata_for_catalog_query = getattr(
+            self,
+            'restricted_course_metadata_for_catalog_query',
+            None,
+        )
+        # Truthy means that the requester wants to see restricted runs AND restricted
+        # runs were actually found for this specific course and the requester's
+        # specific Catalog.
+        if restricted_course_metadata_for_catalog_query:
+            # pylint: disable=protected-access
+            return restricted_course_metadata_for_catalog_query[0]._json_metadata
+        return self._json_metadata
+
+    @json_metadata.setter
+    def json_metadata(self, new_json_metadata):
+        self._json_metadata = new_json_metadata
+
+
+class RestrictedCourseMetadata(BaseContentMetadata):
+    """
+    Copies of courses, but one copy for each CatalogQuery which explicitly
+    allows any restricted runs of the course.
+
+    .. no_pii:
+    """
+    class Meta:
+        verbose_name = _("Restricted Course Metadata")
+        verbose_name_plural = _("Restricted Course Metadata")
+        app_label = 'catalog'
+        unique_together = ('content_key', 'catalog_query')
+
+    history = HistoricalRecords()
+
+    # Overwrite content_key from BaseContentMetadata in order to change unique
+    # to False. Use unique_together to allow multiple copies of the same course
+    # (one for each catalog query.
+    content_key = models.CharField(
+        max_length=255,
+        blank=False,
+        null=False,
+        unique=False,
+        help_text=_(
+            "The key that represents a piece of content, such as a course, course run, or program."
+        )
+    )
+    unrestricted_parent = models.ForeignKey(
+        ContentMetadata,
+        blank=False,
+        null=True,
+        related_name='restricted_courses',
+        on_delete=models.deletion.SET_NULL,
+    )
+    catalog_query = models.ForeignKey(
+        CatalogQuery,
+        blank=False,
+        null=True,
+        related_name='restricted_content_metadata',
+        on_delete=models.deletion.SET_NULL,
+    )
+    restricted_run_allowed_for_restricted_course = models.ManyToManyField(
+        ContentMetadata,
+        through='RestrictedRunAllowedForRestrictedCourse',
+        through_fields=('course', 'run'),
+    )
+    history = HistoricalRecords()
+
+    def __str__(self):
+        """
+        Return human-readable string representation.
+        """
+        catalog_query_id = self.catalog_query.id if self.catalog_query else None
+        return f"<{self.__class__.__name__} for '{self.content_key}' and CatalogQuery ({catalog_query_id})>"
+
+    @staticmethod
+    def allowed_runs_for_course(course_metadata_dict, catalog_query):
+        """
+        Given a ``course_metadata_dict``, returns a filtered list of ``course_runs``
+        containing only unrestricted runs and restricted runs that are allowed by
+        the provided ``catalog_query``.
+        """
+        restricted_runs = RestrictedCourseMetadata.restricted_runs_for_course(course_metadata_dict, catalog_query)
+        unrestricted_runs = [
+            run for run in course_metadata_dict['course_runs']
+            if run.get(COURSE_RUN_RESTRICTION_TYPE_KEY) is None
+        ]
+        return unrestricted_runs + restricted_runs
+
+    @staticmethod
+    def restricted_runs_for_course(course_metadata_dict, catalog_query):
+        """
+        Given a ``course_metadata_dict``, returns a filtered list of ``course_runs``
+        containing only restricted runs that are allowed by
+        the provided ``catalog_query``.
+        """
+        allowed_restricted_runs = catalog_query.restricted_runs_allowed.get(course_metadata_dict['key'], [])
+        return [
+            run for run in course_metadata_dict['course_runs']
+            if run['key'] in allowed_restricted_runs
+        ]
+
+    @property
+    def restricted_run_dicts(self):
+        return self.restricted_runs_for_course(self.json_metadata, self.catalog_query)
+
+    def update_metadata(self, course_metadata_dict, is_full_update=False):
+        """
+        Updates and saves the json_metadata for this restricted course.
+        Params:
+          course_metadata_dict: A dictionary of course metadata
+            fetched from either /api/v1/search/all *or* /api/v1/courses (course-discovery).
+          is_full_update: Whether the course metadata provided is fetched from /api/v1/courses.
+            If so, we fully update the json_metadata of this record with those contents, otherwise
+            the update is trimmed down by `_get_defaults_from_metadata()`. Defaults to False.
+        """
+        if self.catalog_query:
+            filtered_metadata = self.filter_restricted_runs(course_metadata_dict, self.catalog_query)
+        else:
+            filtered_metadata = course_metadata_dict
+
+        if is_full_update:
+            self._json_metadata.update(filtered_metadata)
+        else:
+            # We care about preserving the values of the "plucked"
+            # fields iterated through in `_get_defaults_from_metadata()`
+            # when we're doing a non-full update
+            # (i.e. an update from a course-discovery api/v1/search/all payload)
+            self._json_metadata.update(
+                _get_defaults_from_metadata(filtered_metadata)['_json_metadata'],
+            )
+        self.save()
+
+    def update_course_run_relationships(self):
+        """
+        Updates the relationships between restricted course runs, this
+        restricted course, and this restricted course's catalog_query.
+        """
+        existing_relationships = list(self.catalog_query.contentmetadata_set.filter(
+            parent_content_key=self.content_key,
+        ).values_list('content_key', flat=True))
+        LOGGER.info(
+            '%s has existing course run relationships %s prior to updating',
+            self, existing_relationships,
+        )
+
+        restricted_runs = []
+
+        for course_run_dict in self.restricted_run_dicts:
+            course_run_record = self.update_or_create_run(
+                course_run_key=get_content_key(course_run_dict),
+                parent_content_key=self.content_key,
+                course_run_dict=course_run_dict,
+            )
+            restricted_runs.append(course_run_record)
+
+        # We use a set() here, with clear=True, to clear and then reset the related allowed runs
+        # for this restricted course. This is necessary in the case that a previously-allowed
+        # run becomes unassociated from the restricted course.
+        self.restricted_run_allowed_for_restricted_course.set(restricted_runs, clear=True)
+        LOGGER.info('Updated restricted runs of %s to %s', self, restricted_runs)
+        self.refresh_from_db()
+
+    @classmethod
+    def update_or_create_run(cls, course_run_key, parent_content_key, course_run_dict):
+        """
+        Helper to create a course run ContentMetadata record, provided a content key,
+        a parent course key, and a dictionary of course run metadata.
+        """
+        defaults = _get_defaults_from_metadata(course_run_dict)
+        defaults['parent_content_key'] = parent_content_key
+        # We have to conditionally pop these fields from defaults to keep them from
+        # being used in the UPDATE statement, because the nested course run
+        # data from the /api/v1/search/all payload *does not* include the
+        # course run uuid or aggregation key, which are used by
+        # _get_defaults_from_metadata() to compute the content type and parent key.
+        # We additionally pop the content_key field because it's another primary
+        # identifier used to uniquely identify the record in the non-defaults arguments
+        # in update_or_create() below.
+        for key in ['content_key', 'content_uuid', 'parent_content_key', 'content_type']:
+            if not defaults.get(key):
+                defaults.pop(key)
+        course_run_record, _ = ContentMetadata.objects.update_or_create(
+            content_key=course_run_key,
+            content_type=COURSE_RUN,
+            defaults=defaults,
+        )
+        return course_run_record
+
+    @classmethod
+    def _store_record(cls, course_metadata_dict, catalog_query=None, is_full_update=False):
+        """
+        Given a course metadata dictionary, stores a corresponding
+        ``RestrictedContentMetadata`` record. Raises if the content key
+        is not of type 'course', or if a corresponding unrestricted parent
+        record cannot be found.
+        """
+        content_type = course_metadata_dict.get('content_type')
+        if content_type != COURSE:
+            raise Exception('Can only store RestrictedContentMetadata with content type of course')
+
+        course_key = course_metadata_dict['key']
+        parent_record = ContentMetadata.objects.get(content_key=course_key, content_type=COURSE)
+
+        defaults = {}
+        if content_uuid := get_content_uuid(course_metadata_dict):
+            defaults['content_uuid'] = content_uuid
+
+        record, _ = cls.objects.get_or_create(
+            content_key=course_key,
+            content_type=COURSE,
+            unrestricted_parent=parent_record,
+            catalog_query=catalog_query,
+            defaults=defaults,
+        )
+        record.update_metadata(course_metadata_dict, is_full_update=is_full_update)
+        return record
+
+    @classmethod
+    def store_canonical_record(cls, course_metadata_dict, is_full_update=False):
+        """
+        Stores the canonical copy of this record, which will include all existing
+        course runs for a course, regardless of their restriction status. The canonical
+        record will *not* have a related catalog query.
+        """
+        return cls._store_record(course_metadata_dict, is_full_update=is_full_update)
+
+    @classmethod
+    def store_record_with_query(cls, course_metadata_dict, catalog_query, is_full_update=False):
+        """
+        Stores a restricted course record containing only unrestricted course runs
+        and the restricted course runs explicitly allowed by the provided catalog query.
+        """
+        course_record = cls._store_record(course_metadata_dict, catalog_query, is_full_update=is_full_update)
+        course_record.update_course_run_relationships()
+        return course_record
+
+    @classmethod
+    def filter_restricted_runs(cls, course_metadata_dict, catalog_query):
+        """
+        Returns a copy of ``course_metadata_dict`` whose course_runs list
+        contains only unrestricted runs and restricted runs that are allowed
+        by the provided ``catalog_query``, and whose ``course_runs_keys``,
+        ``course_run_statuses``, and ``first_enrollable_paid_seat_price`` items
+        are updated to take only these allowed runs into account.
+        """
+        filtered_metadata = copy.deepcopy(course_metadata_dict)
+
+        allowed_runs = []
+        allowed_statuses = set()
+        allowed_keys = []
+
+        for run in cls.allowed_runs_for_course(filtered_metadata, catalog_query):
+            allowed_runs.append(run)
+            allowed_statuses.add(run.get('status'))
+            allowed_keys.append(run['key'])
+
+        filtered_metadata['course_runs'] = allowed_runs
+        filtered_metadata['course_run_keys'] = allowed_keys
+        filtered_metadata['course_run_statuses'] = sorted(list(allowed_statuses))
+        filtered_metadata['first_enrollable_paid_seat_price'] = get_course_first_paid_enrollable_seat_price(
+            filtered_metadata,
+        )
+
+        return filtered_metadata
+
+
+class RestrictedRunAllowedForRestrictedCourse(TimeStampedModel):
+    """
+    Mapping table to relate RestrictedCourseMetadata objects to restricted runs in ContentMetadata.
+
+    A run should be mapped to a restricted course IFF the RestrictedCourseMetadata's
+    catalog query explicitly allows the run. This mapping table should be generated by the
+    update-content-metadata task.
+
+    .. no_pii:
+    """
+    course = models.ForeignKey(
+        RestrictedCourseMetadata,
+        blank=False,
+        null=True,
+        on_delete=models.deletion.SET_NULL,
+    )
+    run = models.ForeignKey(
+        ContentMetadata,
+        blank=False,
+        null=True,
+        related_name='restricted_run_allowed_for_restricted_course',
+        on_delete=models.deletion.SET_NULL,
+    )
+
+
+def content_metadata_with_type_course():
+    """
+    Find all ContentMetadata records with a content type of "course".
+    """
+    content_metadata = ContentMetadata.objects.filter(content_type=COURSE)
+
+    if not content_metadata:
+        LOGGER.error('There are no ContentMetadata records of content type "%s".', COURSE)
+        return None
+
+    return content_metadata
+
+
+def _restricted_content_defaults(entry):
+    """
+    Helper to populate the update_or_create() ``defaults``
+    for restricted content.
+    """
+    defaults = {'_json_metadata': entry}
+    if content_uuid := entry.get('uuid'):
+        defaults['content_uuid'] = content_uuid
+    return defaults
+
+
+def _get_defaults_from_metadata(entry, exists=False):
+    """
+    Given a metadata entry from course-discovery's /search/all API endpoint, this function determines the
+    default values to be used when creating/updating ContentMetadata objects (e.g., content_key).
+
+    Regardless of content type, ContentMetadata objects will have its content_key, content_uuid, parent_content_key,
+    and content_type fields updated to reflect the most current state. However, the json_metadata field is only
+    conditionally included as part of the update.
+
+    For net-new ContentMetadata objects, json_metadata is always included, determined by the ``exists``
+    argument. However, for existing ContentMetadata objects, the logic is a bit more complex. For course runs
+    and programs, the json_metadata field should always be fully overwritten with the metadata from /search/all.
+    For courses, the existing json_metadata in the ContentMetadata database object should be merged with a minimal
+    subset of fields that are known to exist only in the /search/all API response. This ensures we are not losing
+    potentially critical fields in this service's ``get_content_metadata`` API endpoint by overwriting the full
+    course metadata, which happens through the update_full_content_metadata_task.
+
+    Arguments:
+        entry (dict): A dictionary representing the metadata about some content from /search/all API response.
+        exists (bool): True if the metadata already exists in the DB, False if not.
+
+    Returns:
+        dict: A dictionary containing the new defaults for the a ContentMetadata object.
+    """
+    content_key = get_content_key(entry)
+    parent_content_key = get_parent_content_key(entry)
+    content_type = get_content_type(entry)
+    content_uuid = get_content_uuid(entry)
+    defaults = {
+        'content_uuid': content_uuid,
+        'content_key': content_key,
+        'parent_content_key': parent_content_key,
+        'content_type': content_type,
+    }
+    if content_type == 'course' and exists:
+        # Only include the json_metadata fields from /search/all that is not present in the
+        # full course metadata to avoid changing the ``get_content_metadata`` API contract.
+        entry_minimal = {}
+        for field in settings.COURSE_FIELDS_TO_PLUCK_FROM_SEARCH_ALL:
+            if value := entry.get(field):
+                entry_minimal[field] = value
+        # Always include 'modified' for staleness detection in incremental Algolia indexing,
+        # regardless of COURSE_FIELDS_TO_PLUCK_FROM_SEARCH_ALL. Without this, the skip logic
+        # in _should_skip_course_update() would fail on subsequent syncs:
+        #   Sync 1: Discovery modified='2024-02-01', DB='2024-01-01' → Different, UPDATE
+        #           (but if 'modified' not persisted, DB stays '2024-01-01')
+        #   Sync 2: Discovery modified='2024-02-01', DB='2024-01-01' → Different, UPDATE again
+        #   (repeats forever until update_full_content_metadata overwrites json_metadata)
+        if modified := entry.get('modified'):
+            entry_minimal['modified'] = modified
+        if entry_minimal:
+            defaults.update({'_json_metadata': entry_minimal})
+    elif not exists or (content_type != 'course'):
+        # Update json_metadata for non-courses when ContentMetadata object already exists. Also,
+        # always include json_metadata (regardless of content type) if ContentMetadata object
+        # does not yet exist in the database.
+        defaults.update({'_json_metadata': entry})
+    return defaults
+
+
+def _parse_datetime_string(dt_string):
+    """
+    Parse a datetime string into a datetime object for comparison.
+
+    Handles different ISO 8601 timezone formats that may differ between
+    Discovery API responses and our stored JSON metadata:
+      - '2024-10-21T20:31:23.006470+00:00' (explicit offset)
+      - '2024-10-21T20:31:23.006470Z' (Zulu time)
+
+    Returns:
+        datetime or None: Parsed datetime object, or None if parsing fails.
+    """
+    if not dt_string or not isinstance(dt_string, str):
+        return None
+
+    dt_string = dt_string.strip()
+
+    # Normalize trailing 'Z' (Zulu time) to an explicit UTC offset so that
+    # datetime.fromisoformat can parse it efficiently.
+    if dt_string.endswith('Z'):
+        dt_string = dt_string[:-1] + '+00:00'
+
+    try:
+        return datetime.fromisoformat(dt_string)
+    except ValueError:
+        return None
+
+
+def _should_skip_course_update(entry, existing_content):
+    """
+    Determine if a course update should be skipped because Discovery's 'modified' timestamp
+    is unchanged.
+
+    For courses, we compare the 'modified' timestamp from the Discovery /search/all response
+    with the existing 'modified' value in our database. If they match, there's no need to
+    update the ContentMetadata record, which avoids unnecessary churn in ContentMetadata.modified
+    and enables accurate staleness detection for incremental Algolia indexing.
+
+    Programs and pathways don't have a 'modified' field from Discovery, so they never skip.
+
+    Arguments:
+        entry (dict): The metadata entry from Discovery's /search/all API response.
+        existing_content (ContentMetadata): The existing ContentMetadata database object.
+
+    Returns:
+        bool: True if the update should be skipped, False otherwise.
+    """
+    if existing_content.content_type != COURSE:
+        return False
+
+    new_modified = _parse_datetime_string(entry.get('modified'))
+    old_modified = _parse_datetime_string(
+        existing_content._json_metadata.get('modified')  # pylint: disable=protected-access
+    )
+
+    if new_modified and old_modified and new_modified == old_modified:
+        return True
+
+    return False
+
+
+def _partition_content_metadata_defaults(batched_metadata, existing_metadata_by_key):
+    """
+    Given a batch of metadata entries and a list of existing ContentMetadata objects, this function
+    determines the default fields to use for creates/updates depending on whether a database object exists
+    for each metadata entry.
+
+    For existing courses, this function also checks if the Discovery 'modified' timestamp has changed.
+    If the timestamp is unchanged, the course is skipped to avoid unnecessary ContentMetadata.modified
+    updates (which enables accurate staleness detection for incremental Algolia indexing).
+
+    Arguments:
+        batched_metadata (list): List of metadata entries from the /search/all API response.
+        existing_metadata_by_key (dict): Dictionary of existing ContentMetadata objects in the
+            database by content key.
+
+    Returns:
+        (existing_metadata_defaults, nonexisting_metadata_defaults, skipped_metadata): Tuple containing:
+            - List of default fields for ContentMetadata objects that already exist and need updating
+            - List of default fields for ContentMetadata objects that will be newly created
+            - List of existing ContentMetadata objects skipped due to unchanged 'modified' timestamp
+              (these must still be included in catalog associations even though they don't need updating)
+    """
+    existing_metadata_defaults = []
+    skipped_metadata = []
+
+    for entry in batched_metadata:
+        content_key = get_content_key(entry)
+        if content_key not in existing_metadata_by_key:
             continue
 
-        # Explicit field→type map avoids fragile string manipulation
-        FIELD_TYPE_MAP = {'skill_names': 'skill', 'subjects': 'subject'}
+        existing_content = existing_metadata_by_key[content_key]
 
-        # Bulk fetch all needed translations at once
-        cache_hits = TranslatedFacetCache.objects.filter(
-            english_value__in=values,
-            field_type=FIELD_TYPE_MAP[field],
-            language_code=language_code,
-        ).values_list('english_value', 'translated_value')
+        # Skip courses where Discovery's 'modified' timestamp is unchanged.
+        # We still need to track these objects for catalog associations.
+        if _should_skip_course_update(entry, existing_content):
+            skipped_metadata.append(existing_content)
+            continue
 
-        lookup = dict(cache_hits)
-        obj[field] = [lookup.get(v, v) for v in values]  # fallback to English if missing
-```
+        existing_metadata_defaults.append(_get_defaults_from_metadata(entry, exists=True))
 
-**Sub-approach C: New management command `populate_translations_all_languages`**
+    nonexisting_metadata_defaults = [
+        _get_defaults_from_metadata(entry)
+        for entry in batched_metadata
+        if get_content_key(entry) not in existing_metadata_by_key
+    ]
 
-**Batch job flow:**
+    return existing_metadata_defaults, nonexisting_metadata_defaults, skipped_metadata
 
-```mermaid
-flowchart TD
-    START([Weekly cron: populate_translations]) --> COLLECT["Collect unique skill_names + subjects\nDB-level JSON extraction\nSELECT DISTINCT jsonb_array_elements_text"]
-    COLLECT --> LOCALE_LOOP["For each target locale\nes fr ar zh-cn de ja ko pt-br..."]
-    LOCALE_LOOP --> CACHE_Q["Query TranslatedFacetCache\nfor existing translations"]
-    CACHE_Q --> MISS{{"Cache misses?"}}
-    MISS -->|"No misses"| NEXT_LOCALE["Next locale"]
-    MISS -->|"Misses found"| BATCH["Split into batches of 50"]
-    BATCH --> AI["Xpert AI batch_translate\nSingle prompt per batch\nJSON array response"]
-    AI --> PARSED{{"Parse OK?"}}
-    PARSED -->|"Yes"| WRITE["bulk_create TranslatedFacetCache\nsource=xpert_ai"]
-    PARSED -->|"Error"| FALLBACK["Keep English value\nLog to Datadog for QA"]
-    FALLBACK --> WRITE
-    WRITE --> MORE{{"More batches?"}}
-    MORE -->|"Yes"| BATCH
-    MORE -->|"No"| NEXT_LOCALE
-    NEXT_LOCALE --> DONE{{"All locales done?"}}
-    DONE -->|"No"| LOCALE_LOOP
-    DONE -->|"Yes"| REINDEX["reindex_algolia\ncreate_localized_algolia_object\nfor each locale"]
-    REINDEX --> END(["Algolia updated\n20+ languages live"])
 
-    style START fill:#c8e6c9,stroke:#388E3C
-    style END fill:#c8e6c9,stroke:#388E3C
-    style FALLBACK fill:#ffebee,stroke:#f44336
-    style WRITE fill:#e3f2fd,stroke:#1565C0
-```
-
-```python
-class Command(BaseCommand):
+def _update_existing_content_metadata(existing_metadata_defaults, existing_metadata_by_key, dry_run=False):
     """
-    Extends populate_spanish_translations to support all 20+ locales.
+    Iterates through existing ContentMetadata database objects, updating the values of various
+    fields based on the defaults provided.
 
-    Algorithm:
-      1. Collect ALL unique skill_names and subjects across all ContentMetadata
-      2. For each target language: batch-query TranslatedFacetCache
-      3. For cache misses only: call Xpert AI in batches of 50 items
-      4. Write results back to TranslatedFacetCache
-      5. Run ContentTranslation population for title/description (already exists)
+    Note: Courses with unchanged Discovery 'modified' timestamps are filtered out earlier
+    in _partition_content_metadata_defaults(), so this function only receives records
+    that actually need updating.
 
-    Designed for:
-      - Scheduled weekly cron job (new skills/subjects accumulate)
-      - Full bootstrap run (first-time for new locale)
-      - On-demand per locale via --language-code flag
+    Arguments:
+        existing_metadata_defaults (list): List of default values for various fields
+            to update the existing ContentMetadata database objects.
+        existing_metadata_by_key (dict): Dictionary of existing ContentMetadata database objects to
+            update by content_key.
+        dry_run (boolean): Logs rather than commits updated content metadata
+
+    Returns:
+        list: List of ContentMetadata objects that were updated.
     """
+    metadata_list = []
+    for defaults in existing_metadata_defaults:
+        content_metadata = existing_metadata_by_key.get(defaults['content_key'])
+        if content_metadata:
+            for key, value in defaults.items():
+                if key == '_json_metadata':
+                    # merge new json_metadata with old json_metadata (i.e., don't replace it fully)
+                    content_metadata._json_metadata.update(value)  # pylint: disable=protected-access
+                else:
+                    # replace attributes with new values
+                    setattr(content_metadata, key, value)
+            metadata_list.append(content_metadata)
 
-    SUPPORTED_LOCALES = ['es', 'fr', 'de', 'ar', 'zh-cn', 'ja', 'ko',
-                         'pt-br', 'ru', 'it', 'nl', 'pl', 'tr', 'vi',
-                         'th', 'id', 'hi', 'sv', 'uk', 'he']
-
-    def handle(self, *args, **options):
-        language_codes = options.get('language_codes') or self.SUPPORTED_LOCALES
-        batch_size = options.get('batch_size', 50)
-
-        # Step 1: Collect unique facet values
-        all_skills   = self._collect_unique_values('skill_names')
-        all_subjects = self._collect_unique_values('subjects')
-
-        for lang in language_codes:
-            self._translate_and_cache('skill', all_skills, lang, batch_size)
-            self._translate_and_cache('subject', all_subjects, lang, batch_size)
-
-    def _collect_unique_values(self, field_name):
-        """
-        Extract unique skill/subject values from all ContentMetadata.
-
-        Performance note: iterating all records in Python is O(N) memory.
-        For large catalogs (100k+ records) prefer a DB-level JSON extraction:
-
-            SELECT DISTINCT jsonb_array_elements_text(
-                json_metadata -> %s
-            ) FROM catalog_contentmetadata;
-
-        The Python fallback below is correct but should only be used on
-        smaller datasets or during bootstrap. Implement the raw SQL path
-        using django.db.connection.cursor() before deploying to production.
-        """
-        from enterprise_catalog.apps.catalog.models import ContentMetadata
-        values = set()
-        for cm in ContentMetadata.objects.only('json_metadata').iterator(chunk_size=2000):
-            items = (cm.json_metadata or {}).get(field_name, [])
-            values.update(items)
-        return list(values)
-
-    def _translate_and_cache(self, field_type, values, language_code, batch_size):
-        """
-        Translate values not yet in TranslatedFacetCache.
-        Uses single Xpert AI batch call for efficiency.
-        """
-        from enterprise_catalog.apps.catalog.models import TranslatedFacetCache
-
-        existing = set(TranslatedFacetCache.objects.filter(
-            english_value__in=values,
-            field_type=field_type,
-            language_code=language_code,
-        ).values_list('english_value', flat=True))
-
-        missing = [v for v in values if v not in existing]
-
-        # Batch translate with Xpert AI (50 items per call)
-        for i in range(0, len(missing), batch_size):
-            batch = missing[i:i+batch_size]
-            translated = self._batch_translate(batch, language_code)
-            objs = [
-                TranslatedFacetCache(
-                    english_value=en,
-                    field_type=field_type,
-                    language_code=language_code,
-                    translated_value=tr,
+    if dry_run:
+        LOGGER.info(f"[Dry Run] Number of Content Metadata records that would have been updated: {len(metadata_list)}")
+        for metadata in metadata_list:
+            LOGGER.info(f"[Dry Run] Skipping Content Metadata update: {metadata}")
+    else:
+        metadata_fields_to_update = ['content_key', 'parent_content_key', 'content_type', '_json_metadata']
+        batch_size = settings.UPDATE_EXISTING_CONTENT_METADATA_BATCH_SIZE
+        for batched_metadata in batch(metadata_list, batch_size=batch_size):
+            try:
+                ContentMetadata.objects.bulk_update(
+                    batched_metadata,
+                    metadata_fields_to_update,
+                    batch_size=batch_size,
                 )
-                for en, tr in zip(batch, translated)
-            ]
-            TranslatedFacetCache.objects.bulk_create(objs, ignore_conflicts=True)
+            except OperationalError:
+                content_keys = [record.content_key for record in batched_metadata]
+                log_message = 'Operational error while updating batch of ContentMetadata objects with keys: %s'
+                LOGGER.exception(log_message, content_keys)
+                raise
+    return metadata_list
 
-    def _batch_translate(self, values: list[str], language_code: str) -> list[str]:
-        """
-        Translate a batch of English strings to language_code via Xpert AI.
 
-        Contract: returns a list of translated strings in the same order
-        as `values`. If the API call fails for any item, return the
-        original English string for that position (never raise).
+def _create_new_content_metadata(nonexisting_metadata_defaults, dry_run=False):
+    """
+    Creates new ContentMetadata database objects based on the defaults provided. This is done through an atomic
+    database transaction.
 
-        Implementation guide:
-          1. Build a single prompt asking Xpert AI to translate all items
-             in a JSON array (e.g. ["Python", "Machine Learning", ...]).
-          2. Request the response as a JSON array in the same order.
-          3. Parse the response; fall back to English on parse failure.
-          4. Add exponential-backoff retry (max 3 attempts).
-          5. Log any per-item fallbacks to Datadog for translation QA.
+    Arguments:
+        nonexisting_metadata_defaults (list): List of default values for various fields to create
+            non-existing ContentMetadata database objects.
+        dry_run (boolean): Logs rather than commits newly-created content metadata.
 
-        Example prompt template:
-          "Translate the following technical terms to {language}.
-           Return ONLY a JSON array of strings in the same order.
-           Terms: {json.dumps(values)}"
-        """
-        from enterprise_catalog.apps.catalog.xpert_ai import chat_completion  # noqa: PLC0415
-        # TODO: implement prompt construction and response parsing
-        raise NotImplementedError(
-            "_batch_translate must be implemented before production use"
+    Returns:
+        list: List of ContentMetadata objects that were created (or logged if dry_run=True).
+    """
+    metadata_list = []
+    try:
+        with transaction.atomic():
+            for defaults in nonexisting_metadata_defaults:
+                if dry_run:
+                    content_metadata = ContentMetadata(**defaults)
+                    LOGGER.info(f"Created {content_metadata}")
+                else:
+                    content_metadata = ContentMetadata.objects.create(**defaults)
+                metadata_list.append(content_metadata)
+    except IntegrityError:
+        LOGGER.exception('_create_new_content_metadata ran into an issue while creating new ContentMetadata objects.')
+    return metadata_list
+
+
+def _fetch_product_source(metadata_entry):
+    product_source = metadata_entry.get('product_source')
+    if isinstance(product_source, dict):
+        return product_source.get('slug')
+    else:
+        return product_source
+
+
+def _should_allow_metadata(metadata_entry, catalog_query=None):
+    """
+    Determines if an object from Discovery meets our criteria for indexing
+
+    Arguments:
+        metadata_entry: A single content metadata dictionary.
+
+    Returns:
+        bool: If we should save the metadata as a ContentMetaData object
+    """
+    entry_product_source = _fetch_product_source(metadata_entry)
+    if entry_product_source is not None and entry_product_source.lower() not in CONTENT_PRODUCT_SOURCE_ALLOW_LIST:
+        LOGGER.warning(
+            '(ENT-7893.a) catalog query %s disallows metadata not in source allow list %s',
+            catalog_query.id,
+            metadata_entry.get('key'),
         )
-```
-
----
-
-### Layer 5: Frontend Locale Routing
-
-**Repo:** `frontend-app-learner-portal-enterprise`  
-**File:** `src/components/app/data/hooks/useAlgoliaSearch.ts`
-
-The frontend must tell Algolia which language to return facet values in, by filtering on `metadata_language`.
-
-```tsx
-// useAlgoliaSearch.ts
-import { useIntl } from '@edx/frontend-platform/i18n';
-
-/**
- * Maps BCP-47 locale codes (as returned by @edx/frontend-platform/i18n)
- * to the backend language_code values stored in Algolia metadata_language.
- *
- * MUST stay in sync with SUPPORTED_LOCALES in populate_translations.py.
- * Regional variants (e.g. es-419) map to their base locale ('es') so that
- * a single Algolia object serves all regional users.
- *
- * Fallback chain:  specific-variant → base-locale → 'en'
- * e.g. 'zh-tw' → 'zh-cn' → 'en'  (if zh-tw not explicitly mapped)
- */
-const ALGOLIA_LOCALE_MAP: Record<string, string> = {
-  'en':      'en',
-  'en-us':   'en',
-  'es':      'es',
-  'es-419':  'es',
-  'es-es':   'es',
-  'fr':      'fr',
-  'fr-ca':   'fr',
-  'ar':      'ar',
-  'zh-cn':   'zh-cn',
-  'zh-tw':   'zh-cn',  // serve zh-cn until zh-tw index is bootstrapped
-  'ja':      'ja',
-  'ko':      'ko',
-  'pt-br':   'pt-br',
-  'pt':      'pt-br',
-  'de':      'de',
-  'ru':      'ru',
-  'it':      'it',
-  'nl':      'nl',
-  'pl':      'pl',
-  'tr':      'tr',
-  'vi':      'vi',
-  'th':      'th',
-  'id':      'id',
-  'hi':      'hi',
-  'sv':      'sv',
-  'uk':      'uk',
-  'he':      'he',
-};
-
-/** Resolve BCP-47 locale to Algolia language_code with fallback to 'en'. */
-function resolveAlgoliaLocale(locale: string): string {
-  const lower = locale.toLowerCase();
-  // 1. Exact match
-  if (ALGOLIA_LOCALE_MAP[lower]) return ALGOLIA_LOCALE_MAP[lower];
-  // 2. Base-language match (e.g. 'fr-BE' → 'fr')
-  const base = lower.split('-')[0];
-  if (ALGOLIA_LOCALE_MAP[base]) return ALGOLIA_LOCALE_MAP[base];
-  // 3. Fallback
-  return 'en';
-}
-
-export const useAlgoliaSearch = () => {
-  const { locale } = useIntl();
-  const algoliaLocale = resolveAlgoliaLocale(locale);
-
-  // Add metadata_language filter to Algolia queries
-  const baseFilter = `metadata_language:'${algoliaLocale}'`;
-
-  return {
-    baseFilter,        // passed to <InstantSearch> or Configure component
-    algoliaLocale,
-  };
-};
-```
-
-**In `Search.jsx` / `SearchPage.jsx`:**
-```jsx
-const { baseFilter } = useAlgoliaSearch();
-
-// Pass to <Configure filters={baseFilter} />
-// This ensures facet values returned from Algolia are already in the user's locale
-```
-
----
-
-### Layer 6: Backend Multi-Language Pipeline
-
-**Summary of all backend changes in `enterprise-catalog`:**
-
-```
-enterprise-catalog/
-├── enterprise_catalog/apps/catalog/
-│   ├── models.py
-│   │   ├── ContentTranslation (existing — generalize language_code)
-│   │   └── TranslatedFacetCache (NEW)
-│   │
-│   ├── translation_utils.py
-│   │   ├── translate_to_spanish()         → rename to translate_text(text, language_code)
-│   │   ├── translate_skills_or_subjects() → use TranslatedFacetCache lookup first
-│   │   └── translate_facet_value()        → keep, add multi-lang translation maps
-│   │
-│   ├── algolia_utils.py
-│   │   ├── create_spanish_algolia_object() → keep as wrapper around:
-│   │   └── create_localized_algolia_object(obj, metadata, language_code) (NEW)
-│   │
-│   └── management/commands/
-│       ├── populate_spanish_translations.py  (existing — call generalized version)
-│       └── populate_translations.py          (NEW — all locales + facet cache)
-│
-└── migrations/
-    └── XXXX_add_translated_facet_cache.py   (NEW)
-```
-
-**Cron job schedule recommendation:**
-
-```
-# Weekly: translate newly-added skills and subjects
-0 2 * * 0  populate_translations --facets-only --incremental
-
-# Monthly: re-index Algolia with all translated objects
-0 3 1 * *  reindex_algolia
-
-# On new locale addition: one-time full bootstrap
-populate_translations --language-codes fr --full
-reindex_algolia --language-codes fr
-```
-
----
-
-## 5. Phased Delivery Plan
-
-```
-PHASE 1 — Static UI Strings (2–3 weeks)
-Effort: Low | Impact: High | Risk: Low
-──────────────────────────────────────────────────────────────────
-Repo: frontend-enterprise (catalog-search package)
-  □ Add filter title message IDs to messages.js (Skills, Subject, Level, etc.)
-  □ Add placeholder/ariaLabel message IDs to messages.js
-  □ Update FacetDropdown.jsx to use intl.formatMessage for title
-  □ Update TypeaheadFacetDropdown.jsx to use intl for placeholder/ariaLabel
-  □ Run i18n_extract and open PR to openedx-translations
-  □ Bump package version, update in consuming apps
-Deliverable: All filter chrome translates to any locale already
-             supported by openedx-translations
-
-
-PHASE 2 — Subject Option Values (1–2 weeks)
-Effort: Low | Impact: Medium | Risk: Low
-──────────────────────────────────────────────────────────────────
-Repo: frontend-enterprise (catalog-search package)
-  □ Enumerate all ~50-100 active subject values from course-discovery
-  □ Add each to messages.js (one defineMessages entry per subject)
-  □ Run i18n_extract → openedx-translations
-  □ FacetItem.jsx already handles this via messages[item.label] lookup
-Deliverable: Subject dropdown options translated via i18n files
-
-
-PHASE 3 — Backend: TranslatedFacetCache + Generalized Pipeline (4–6 weeks)
-Effort: High | Impact: Critical | Risk: Medium
-──────────────────────────────────────────────────────────────────
-Repo: enterprise-catalog
-  □ Add TranslatedFacetCache model + migration
-  □ Refactor translate_to_spanish() → translate_text(text, language_code)
-  □ Refactor create_spanish_algolia_object() →
-        create_localized_algolia_object(obj, metadata, lang)
-  □ New management command: populate_translations
-        - Supports --language-codes flag
-        - Collects unique skill/subject values
-        - Batch translates cache misses via Xpert AI
-        - Writes to TranslatedFacetCache
-  □ Update reindex_algolia to call create_localized_algolia_object
-        for all SUPPORTED_LOCALES (not just Spanish)
-  □ Set up weekly cron for incremental facet cache population
-Deliverable: Algolia index contains translated objects for all 20 locales
-
-
-PHASE 4 — Frontend Locale Routing (1–2 weeks)
-Effort: Low | Impact: Critical | Risk: Low
-──────────────────────────────────────────────────────────────────
-DEPENDENCY: Phase 3 backend must be fully deployed AND at least one
-non-English locale must be completely indexed in Algolia before this
-phase is user-visible. Deploying the frontend locale filter against
-an index that only has English objects will return zero results for
-non-English users. Coordinate release with enterprise-catalog deploy.
-
-Repo: frontend-app-learner-portal-enterprise
-  □ Add ALGOLIA_LOCALE_MAP constant and resolveAlgoliaLocale() helper
-  □ Update useAlgoliaSearch to derive metadata_language filter from locale
-  □ Pass filter to Algolia <Configure> component
-  □ Test locale switching fully refreshes all facet options
-  □ Test English baseline (no regression)
-Deliverable: Selecting a locale shows translated skill/subject facets from Algolia
-
-
-PHASE 5 — QA, Accessibility & Edge Cases (2 weeks)
-Effort: Medium | Impact: High | Risk: Low
-──────────────────────────────────────────────────────────────────
-  □ Test all 20 locales end-to-end on the search page
-  □ Verify RTL layout works for ar, he, fa
-  □ Verify "Ability" filter source (confirm attribute name + apply matching phase)
-  □ Test locale switch mid-session: filters fully re-render
-  □ Test mixed-language prevention (no EN facet values showing with FR locale)
-  □ Test fallback: locale with no translations shows EN gracefully
-  □ Add i18n tests to SearchFilters and FacetDropdown component tests
-```
-
----
-
-## 6. Repository Touchpoints
-
-**Deployment dependency order:**
-
-```mermaid
-flowchart TD
-    FE["openedx/frontend-enterprise\nmessages.js + components updated"]
-    TRANS["openedx-translations\ni18n_extract → Transifex → 20+ locale .json"]
-    EC["enterprise-catalog\nTranslatedFacetCache + generalized pipeline"]
-    BOOTSTRAP["Bootstrap run\npopulate_translations + reindex_algolia\nfor es fr ar"]
-    PORTAL["frontend-app-learner-portal-enterprise\nuseAlgoliaSearch locale routing"]
-
-    FE -->|"npm publish v12.x"| PORTAL
-    FE -->|"i18n_extract"| TRANS
-    TRANS -->|"build-time locale files"| PORTAL
-    EC --> BOOTSTRAP
-    BOOTSTRAP -->|"HARD DEPENDENCY\nindex must be populated first"| PORTAL
-    EC -->|"Phase 3 before Phase 4"| PORTAL
-
-    style BOOTSTRAP fill:#ffcc80,stroke:#E65100,stroke-width:2px
-    style PORTAL fill:#f3e5f5,stroke:#6A1B9A
-```
-
-| Repository | Files to modify | Change type |
-|---|---|---|
-| `openedx/frontend-enterprise` | `packages/catalog-search/src/messages.js` | Add filter title + placeholder + subject messages |
-| `openedx/frontend-enterprise` | `packages/catalog-search/src/FacetDropdown.jsx` | Use `intl.formatMessage` for title |
-| `openedx/frontend-enterprise` | `packages/catalog-search/src/TypeaheadFacetDropdown.jsx` | Use `intl.formatMessage` for placeholder/ariaLabel |
-| `openedx/frontend-enterprise` | `packages/catalog-search/src/data/constants.js` | Add `titleMessageKey`, `placeholderMessageKey` to filter defs |
-| `openedx-translations` | `translations/frontend-enterprise-catalog-search/` | Populated by Transifex via i18n_extract + openedx-translations CI |
-| `edx/enterprise-catalog` | `apps/catalog/models.py` | Add `TranslatedFacetCache` model |
-| `edx/enterprise-catalog` | `apps/catalog/translation_utils.py` | Generalize to multi-language |
-| `edx/enterprise-catalog` | `apps/catalog/algolia_utils.py` | Add `create_localized_algolia_object`, update indexing loop |
-| `edx/enterprise-catalog` | `apps/catalog/management/commands/populate_translations.py` | New: multi-language, all locales, facet cache |
-| `edx/frontend-app-learner-portal-enterprise` | `src/components/app/data/hooks/useAlgoliaSearch.ts` | Add locale → `metadata_language` filter |
-| `edx/frontend-app-learner-portal-enterprise` | `src/components/search/SearchPage.jsx` or `Search.jsx` | Pass `metadata_language` filter to Algolia `<Configure>` |
-
----
-
-## 7. ADRs — Architecture Decision Records
-
-### ADR-1: Single Algolia Index vs. Per-Locale Indexes
-
-**Decision:** Use a **single Algolia index** with `metadata_language` field to differentiate locales.
-
-**Rejected alternative:** One Algolia index per locale (e.g. `product_fr`, `product_ar`).
-
-**Rationale:**
-- Algolia charges per index in most plans; 20 locales × existing index count = significant cost increase
-- Managing 20× replica configs, rules, and synonyms is operationally complex
-- Single index with `metadata_language` filter achieves the same isolation cleanly
-- Already the direction the existing Spanish implementation uses (`metadata_language='es'`)
-
-**Algolia object count impact (must be planned for):**
-
-With 100,000 content items and 20 locales the index grows to ~2,000,000 objects. Before enabling all locales:
-1. Confirm current Algolia plan record limit and request an upgrade if needed
-2. Measure index build time: a 2M-object reindex may take 4–6 hours on a background worker
-3. Stage the rollout: enable 3–5 priority locales first, then expand incrementally
-4. Index only locales for which `ContentTranslation` rows exist (skip rather than write English duplicates)
-
----
-
-### ADR-2: Pre-index Translation vs. Runtime Translation
-
-**Decision:** All skill and subject translations must be **pre-computed and stored in Algolia** before the user request arrives. Zero translation API calls during search queries.
-
-**Rejected alternative:** Translate `item.label` in the React component on each render.
-
-**Rationale:**
-- Skills can have thousands of unique values per locale
-- Translation API calls on each filter render would be catastrophically slow (hundreds of sequential API calls)
-- The existing `translate_skills_or_subjects()` calling Xpert AI at index time is acceptable only because it runs in a batch job, not on user request
-- Pre-indexed values also allow Algolia's typeahead search to work in the user's language
-
----
-
-### ADR-3: `TranslatedFacetCache` vs. Re-translating Per-Course
-
-**Decision:** Introduce a **`TranslatedFacetCache` DB table** keyed on `(english_value, field_type, language_code)`.
-
-**Rejected alternative:** Call `translate_skills_or_subjects()` per ContentMetadata object during `reindex_algolia` (current AS-IS behavior for Spanish).
-
-**Rationale:**
-- `"Python"` appears as a skill in 10,000+ courses. Without a cache, it gets translated 10,000 times per locale per reindex
-- With 20 locales that is 200,000 Xpert AI calls for a single skill value
-- `TranslatedFacetCache` reduces this to **1 API call per unique value per locale, ever**
-- The cache is populated by a separate `populate_translations` management command run weekly
-
----
-
-### ADR-4: Subject Values in `messages.js` vs. Algolia Pre-index
-
-**Decision:** Use **`messages.js` static lookup** for subjects up to ~100 values (Phase 2); additionally pre-index them in Algolia (Phase 3) when the pipeline generalization is complete.
-
-**Rationale:**
-- Subjects are a finite, stable, well-known set sourced from `course-discovery` Subject model
-- Adding them to `messages.js` is a 1-sprint effort and unblocks translation for all locales already in openedx-translations
-- It also works for the `CurrentRefinements` chip display (uses same `messages[item.label]` lookup)
-- Pre-indexing subjects in Algolia is still needed for Phase 3 so that the `metadata_language` filter correctly shows only translated-locale objects; both approaches complement each other
-
----
-
-### ADR-5: Ability Filter
-
-**Decision (pending):** The `Ability` filter is **not present in the upstream `SEARCH_FACET_FILTERS` constant** in `frontend-enterprise` as of April 2026. Its Algolia attribute name and source must be confirmed before implementation.
-
-**Action required:** Engineering must verify:
-1. Which Algolia attribute `Ability` maps to (e.g. `accessibility_info`, `skills.ability_types`)
-2. Whether it is defined in the consuming app (`frontend-app-learner-portal-enterprise`) or the shared package
-3. Whether values are dynamic (Algolia) or static (component-hardcoded)
-
-Once confirmed, apply the matching strategy from the Translation Classification Matrix above.
-
----
-
-## 8. Generic Reusable Solution for All Dynamic Filter Tickets
-
-This section describes the **reusable enterprise pattern** that should be used for all future translation tickets, including:
-
-- Skills filter
-- Subject filter
-- Industry filter
-- Job title filter
-- Ability filter
-- Learning type / level / partner / provider filters
-- Any future Algolia-backed dynamic dropdown
-
-### Core Recommendation
-
-Use a **3-layer translation model**:
-
-1. **Static UI text**
-   - Example: `Industry`, `Find an industry...`, `Skills`, `Find a skill...`
-   - Stored in frontend message catalogs via `defineMessages`
-   - Translated by normal frontend i18n pipeline
-
-2. **Canonical business value**
-   - Example: `industry_id = fintech`, `industry_code = healthcare`, `skill_key = machine-learning`
-   - Stored once in database / taxonomy source as the **stable key**
-   - Never changes with locale
-   - Used for quiz logic, recommendations, filtering, analytics, and persistence
-
-3. **Localized display value**
-   - Example:
-     - `fintech` → `Financial Technology` in English
-     - `fintech` → `Tecnología financiera` in Spanish
-   - Stored in translation tables and indexed into Algolia
-   - Used only for UI display and localized search typing
-
-### Why this is the right generic solution
-
-This solves the root problem behind all tickets:
-
-- the learner must **see translated labels**
-- the learner must **type and search in the visible language**
-- the system must still **run the same business logic regardless of language**
-
-So the rule is:
-
-> **Display localized text, but keep logic on canonical keys/IDs.**
-
-That is the most important architectural principle.
-
-### Generic End-to-End Flow
-
-```text
-                ┌────────────────────────────┐
-                │ Source taxonomy / metadata │
-                │  industries, skills, etc.  │
-                └──────────────┬─────────────┘
-                               │
-                               ▼
-                ┌────────────────────────────┐
-                │ Normalize to canonical key │
-                │  e.g. industry_code=fintech│
-                └──────────────┬─────────────┘
-                               │
-                               ├─────────────────────────────┐
-                               │                             │
-                               ▼                             ▼
-              ┌───────────────────────────┐   ┌───────────────────────────┐
-              │ Base entity / facet value │   │ Translation table         │
-              │ stores canonical identity │   │ stores per-locale labels  │
-              └──────────────┬────────────┘   └──────────────┬────────────┘
-                             │                               │
-                             └──────────────┬────────────────┘
-                                            │
-                                            ▼
-                         ┌───────────────────────────────────────┐
-                         │ Index builder creates localized       │
-                         │ Algolia documents / facet values      │
-                         └──────────────────┬────────────────────┘
-                                            │
-                                            ▼
-                         ┌───────────────────────────────────────┐
-                         │ Algolia returns localized label       │
-                         │ plus canonical id/code               │
-                         └──────────────────┬────────────────────┘
-                                            │
-                                            ▼
-                         ┌───────────────────────────────────────┐
-                         │ Frontend shows translated dropdown    │
-                         │ but stores selected canonical id      │
-                         └───────────────────────────────────────┘
-```
-
-### Generic Operating Model for Future Tickets
-
-For each new translation ticket, classify the field first:
-
-| Type | Example | Best solution |
-|---|---|---|
-| Static UI string | `Industry`, `Find an industry...` | Frontend `defineMessages` |
-| Closed vocabulary | `Introductory`, `Advanced` | Shared message lookup |
-| Semi-dynamic taxonomy | `Industries`, `Subjects` | DB translation table + Algolia localized indexing |
-| Fully dynamic taxonomy | `Skills`, `Job titles` | Canonical ID + translation cache + localized Algolia indexing |
-
-This classification prevents over-engineering and makes new tickets predictable.
-
----
-
-## 9. Efficient Backend-Centric Translation Model
-
-> **Relationship to `TranslatedFacetCache` (Section 4):**  
-> Section 4 introduces `TranslatedFacetCache` — a lightweight string-keyed cache sufficient to unblock Phase 3 delivery quickly. The normalized `FacetValue` + `FacetValueTranslation` schema described below is the **long-term target**. They are not competing designs; `TranslatedFacetCache` is the pragmatic Phase 3 table that should be **migrated into** the normalized schema once the broader framework is in place. In the interim, the two tables serve the same query contract and the indexing code must not reference both simultaneously.
-
-If many translation tickets are expected, the most efficient long-term design is to make the database the **source of truth for dynamic translated labels**.
-
-### Recommended efficient solution
-
-Use a single normalized backend translation framework with four rules:
-
-1. **Static UI strings remain in frontend i18n catalogs**
-  - labels, placeholders, helper text, and aria labels
-2. **Dynamic filter values are stored in backend translation tables**
-  - industries, skills, subjects, job titles, and abilities
-3. **Business logic always uses canonical keys**
-  - never localized display labels
-4. **Algolia is only the localized search projection layer**
-  - not the source of truth for translations
-
-This is the lowest total-cost model when many translation tickets across 20+ locales are expected.
-
-### Recommended schema pattern
-
-Use a normalized design rather than storing translated strings ad hoc in many places.
-
-#### A. Canonical facet value table
-
-```python
-class FacetValue(models.Model):
+        return False
+    # make sure to exclude exec ed course runs
+    content_type = get_content_type(metadata_entry)
+    if content_type != 'course':
+        return True
+    entry_course_type = metadata_entry.get('course_type')
+    # allowing None here accounts for pre-existing tests, dirty prod data
+    if entry_course_type is None or entry_course_type in CONTENT_COURSE_TYPE_ALLOW_LIST:
+        return True
+    return False
+
+
+def create_content_metadata(metadata, catalog_query=None, dry_run=False):
     """
-    Stores the stable identity of a filter value.
-    Example rows:
-      facet_type='industry', canonical_key='fintech'
-      facet_type='skill',    canonical_key='machine-learning'
-      facet_type='subject',  canonical_key='computer-science'
+    Creates or updates a ContentMetadata object.
+
+    Arguments:
+        metadata (list): List of content metadata dictionaries.
+        catalog_query (CatalogQuery): Catalog Query object.
+        dry_run (boolean): Logs rather than commits content metadata additions.
+
+    Returns:
+        list: The list of ContentMetaData.
     """
-    facet_type = models.CharField(max_length=50, db_index=True)
-    canonical_key = models.CharField(max_length=255, db_index=True)
-    source_value = models.CharField(max_length=500)
-    source_system = models.CharField(max_length=50, default='discovery')
-    is_active = models.BooleanField(default=True)
+    metadata_list = []
+    retry_list = []
+
+    for batched_metadata in batch(metadata, batch_size=settings.SELECT_EXISTING_CONTENT_METADATA_BATCH_SIZE):
+        content_keys = []
+        filtered_batched_metadata = []
+        for entry in batched_metadata:
+            # Exclude exec ed courses from being ingested unless the query specifies that they are allowed
+            if _should_allow_metadata(entry, catalog_query):
+                content_keys.append(get_content_key(entry))
+                filtered_batched_metadata.append(entry)
+
+        _update_or_create_content_metadata(
+            content_keys, filtered_batched_metadata, dry_run, metadata_list, retry_list,
+        )
+
+    retry_count = 0
+    retry_max = getattr(settings, 'CATALOG_CONTENT_METADATA_RETRY_MAX', 1000)
+
+    if not retry_list:
+        return metadata_list
+
+    retry_keys = [get_content_key(entry) for entry in retry_list]
+    LOGGER.info(
+        'Starting retry loop for %s keys: %s',
+        len(retry_list),
+        retry_keys,
+    )
+
+    while retry_list and (retry_count < retry_max):
+        # in this second pass, we'll update one existing record at a time to avoid deadlocks
+        retry_count += 1
+        metadata_record = retry_list.pop(0)
+        content_keys = [get_content_key(metadata_record)]
+        filtered_batched_metadata = [metadata_record]
+        _update_or_create_content_metadata(
+            content_keys, filtered_batched_metadata, dry_run, metadata_list, retry_list,
+        )
+
+    LOGGER.info(
+        'End retry loop with remaining keys %s, retry_count %s',
+        retry_keys,
+        retry_count,
+    )
+
+    return metadata_list
+
+
+def _update_or_create_content_metadata(content_keys, filtered_batched_metadata, dry_run, metadata_list, retry_list):
+    """
+    Helper to do the updates of existing metadata and creation of new metadata.
+    Called for side-effect: modifies both ``metadata_list`` and ``retry_list``.
+    """
+    nonexisting_metadata_defaults = None
+    try:
+        updated_metadata, nonexisting_metadata_defaults = _execute_updates_existing_records_avoid_deadlock(
+            content_keys, filtered_batched_metadata, dry_run,
+        )
+        metadata_list.extend(updated_metadata)
+    except DatabaseError as exc:
+        LOGGER.warning('Error during update of existing content keys %s: %s', content_keys, exc)
+        retry_list.extend(filtered_batched_metadata)
+
+    if nonexisting_metadata_defaults:
+        created_metadata = _create_new_content_metadata(nonexisting_metadata_defaults, dry_run)
+        metadata_list.extend(created_metadata)
+
+
+@transaction.atomic()
+def _execute_updates_existing_records_avoid_deadlock(content_keys, filtered_batched_metadata, dry_run):
+    """
+    Finds and updates existing metadata records matching the given content keys, returning
+    a list of the updated records (including skipped records that don't need updating),
+    along with a set of metadata defaults for content_keys that do *not* already exist
+    in the system. This version tries to avoid deadlocks by using a transaction with
+    select_for_update().
+
+    Note: Skipped records (courses with unchanged 'modified' timestamps) are included in
+    the returned list even though they weren't updated. This is critical because the
+    returned list is used for catalog associations - excluding skipped records would
+    cause them to be disassociated from their catalogs.
+    """
+    # see https://docs.djangoproject.com/en/5.2/ref/models/querysets/#select-for-update
+    existing_metadata = ContentMetadata.objects.filter(
+        content_key__in=content_keys
+    ).order_by('pk').select_for_update()
+    existing_metadata_by_key = {metadata.content_key: metadata for metadata in existing_metadata}
+    existing_metadata_defaults, nonexisting_metadata_defaults, skipped_metadata = _partition_content_metadata_defaults(
+        filtered_batched_metadata, existing_metadata_by_key
+    )
+
+    # Safeguard: Verify all items in the batch are accounted for (updated, created, or skipped).
+    # This catches bugs where items are accidentally "lost" from the pipeline.
+    accounted_count = len(existing_metadata_defaults) + len(nonexisting_metadata_defaults) + len(skipped_metadata)
+    batch_count = len(filtered_batched_metadata)
+    if accounted_count != batch_count:
+        LOGGER.error(
+            '[CONTENT_METADATA_SAFEGUARD] Batch item count mismatch: batch=%d, accounted=%d '
+            '(existing=%d, new=%d, skipped=%d). This may indicate a bug in the update pipeline.',
+            batch_count,
+            accounted_count,
+            len(existing_metadata_defaults),
+            len(nonexisting_metadata_defaults),
+            len(skipped_metadata),
+        )
+
+    if skipped_metadata:
+        LOGGER.info(
+            'Skipped %d course updates in this batch where Discovery modified timestamp was unchanged',
+            len(skipped_metadata),
+        )
+
+    # Update existing ContentMetadata records
+    updated_metadata = _update_existing_content_metadata(
+        existing_metadata_defaults,
+        existing_metadata_by_key,
+        dry_run
+    )
+
+    # Include skipped metadata in the returned list so they maintain their catalog associations.
+    # These records don't need updating but must still be associated with catalogs.
+    updated_metadata.extend(skipped_metadata)
+
+    return updated_metadata, nonexisting_metadata_defaults
+
+
+def _check_content_association_threshold(catalog_query, metadata_list):
+    """
+    Helper method to check a given catalog query's content metadata association set and compare it to a new set of
+    metadata records. Should the two sets of records differ in size beyond a configurable percentage value, and are
+    evaluated to be applicable, this method returns True, indicating the threshold of difference has been met.
+
+    Applicability for the threshold is defined as such:
+    - The existing set of content associations must exceed a configurable cutoff value
+    - The query must have not been modified today, meaning it's stale
+    - The change in number of content association records must exceed a configurable percentage, both in a positive and
+    negative direction (ie the query loses or gains more than x% of its prior number of records)
+    """
+    existing_relations_size = catalog_query.contentmetadata_set.count()
+    new_relations_size = len(metadata_list)
+
+    # Safeguard: Never allow wiping out a catalog's associations entirely.
+    # This catches severe bugs where the metadata pipeline returns an empty list
+    # when it should have returned content.
+    if existing_relations_size > 0 and new_relations_size == 0:
+        LOGGER.error(
+            '[CONTENT_METADATA_SAFEGUARD] Blocked attempt to remove all %d content associations from query %s. '
+            'This likely indicates a bug in the content metadata pipeline.',
+            existing_relations_size,
+            catalog_query,
+        )
+        return True
+
+    # To prevent false positives, this content association action stop gap will only apply to reasonably sized
+    # content sets
+    LOGGER.info(
+        '_check_content_association_threshold is checking the guardrail consideration floor of: %s for query: %s',
+        settings.CATALOG_CONTENT_INCLUSION_GUARDRAIL_CONSIDERATION_FLOOR,
+        catalog_query,
+    )
+    if existing_relations_size > settings.CATALOG_CONTENT_INCLUSION_GUARDRAIL_CONSIDERATION_FLOOR:
+        # If the catalog query hasn't been modified yet today, means there's no immediate reason for such a
+        # large change in content associations
+        LOGGER.info(
+            '_check_content_association_threshold is checking the modified value: %s of query: %s as compared to '
+            'todays date: %s',
+            catalog_query.modified.date(),
+            catalog_query,
+            localized_utcnow().date(),
+        )
+        if catalog_query.modified.date() < localized_utcnow().date():
+            # Check if the association of content results in a percentage change of
+            # `CATALOG_CONTENT_INCLUSION_GUARDRAIL_ALLOWABLE_DELTA` of content items from the query's content set.
+            percent_change = abs((new_relations_size - existing_relations_size) / existing_relations_size)
+            LOGGER.info(
+                '_check_content_association_threshold is checking the percent change: %s of query: %s as compared to '
+                'the threshold: %s',
+                percent_change,
+                catalog_query,
+                settings.CATALOG_CONTENT_INCLUSION_GUARDRAIL_ALLOWABLE_DELTA,
+            )
+            if percent_change > settings.CATALOG_CONTENT_INCLUSION_GUARDRAIL_ALLOWABLE_DELTA:
+                LOGGER.warning(
+                    "[CONTENT_DELTA_WARNING] associate_content_metadata_with_query is requested to set query: "
+                    "%s to a content metadata set of length of %s when it previous had a content metadata set length "
+                    "of:%s. The current threshold cutoff is a delta of: %s content remaining. The update has been "
+                    "prevented.",
+                    catalog_query,
+                    new_relations_size,
+                    existing_relations_size,
+                    settings.CATALOG_CONTENT_INCLUSION_GUARDRAIL_ALLOWABLE_DELTA,
+                )
+                return True
+            elif percent_change > settings.CATALOG_CONTENT_ASSOCIATIONS_CONTENT_DELTA_WARNING_THRESHOLD:
+                LOGGER.warning(
+                    "[CONTENT_DELTA_WARNING] associate_content_metadata_with_query hit the warning threshold: %s "
+                    "while setting query: %s to a content metadata set of length of %s when it previous had a content "
+                    "metadata set length of:%s.",
+                    settings.CATALOG_CONTENT_ASSOCIATIONS_CONTENT_DELTA_WARNING_THRESHOLD,
+                    catalog_query,
+                    new_relations_size,
+                    existing_relations_size,
+                )
+    return False
+
+
+def associate_content_metadata_with_query(metadata, catalog_query, dry_run=False):
+    """
+    Creates or updates a ContentMetadata object for each entry in `metadata`,
+    and then associates that object with the `catalog_query` provided.
+
+    Arguments:
+        metadata (list): List of content metadata dictionaries.
+        catalog_query (CatalogQuery): CatalogQuery object
+        dry_run (boolean): Logs rather than commits updated content metadata.
+
+    Returns:
+        list: The list of content_keys for the metadata associated with the query.
+    """
+    metadata_list = create_content_metadata(metadata, catalog_query, dry_run)
+    # Stop gap if the new metadata list is extremely different from the current one
+    if _check_content_association_threshold(catalog_query, metadata_list):
+        return list(catalog_query.contentmetadata_set.values_list('content_key', flat=True))
+    # Setting `clear=True` will remove all prior relationships between
+    # the CatalogQuery's associated ContentMetadata objects
+    # before setting all new relationships from `metadata_list`.
+    # https://docs.djangoproject.com/en/2.2/ref/models/relations/#django.db.models.fields.related.RelatedManager.set
+    if dry_run:
+        old_metadata_count = catalog_query.contentmetadata_set.count()
+        new_metadata_count = len(metadata_list)
+        if old_metadata_count != new_metadata_count:
+            LOGGER.info('[Dry Run] Updated metadata count ({} -> {}) for {}'.format(
+                old_metadata_count, new_metadata_count, catalog_query))
+    else:
+        catalog_query.contentmetadata_set.set(metadata_list, clear=True)
+
+    associated_content_keys = [metadata.content_key for metadata in metadata_list]
+    return associated_content_keys
+
+
+def create_course_associated_programs(programs, course_content_metadata):
+    """
+    Creates or updates a ContentMetadata object for each entry in `programs`,
+    and then associates that object with the `course_content_metadata` provided.
+
+    Arguments:
+        programs (list): List of program metadata dictionaries extracted from course.
+        course_content_metadata (ContentMetadata): ContentMetaData object
+
+    Returns:
+        list: The list of content_keys for the metadata associated with the query.
+    """
+    for program in programs:
+        program['aggregation_key'] = f'program:{program["uuid"]}'
+        program['content_type'] = 'program'
+    metadata_list = create_content_metadata(programs)
+
+    # remove existing associated_content_metadata relationship between program and courses before adding new relation
+    course_content_metadata.associated_content_metadata.remove(
+        *course_content_metadata.associated_content_metadata.filter(content_type=PROGRAM)
+    )
+    course_content_metadata.associated_content_metadata.add(*metadata_list)
+
+    associated_content_keys = [metadata.content_key for metadata in metadata_list]
+    return associated_content_keys
+
+
+class EnterpriseCatalogFeatureRole(UserRole):
+    """
+    User role definitions specific to Enterprise Catalog.
+     .. no_pii:
+    """
+
+    def __str__(self):
+        """
+        Return human-readable string representation.
+        """
+        return f"EnterpriseCatalogFeatureRole(name={self.name})"
+
+    def __repr__(self):
+        """
+        Return uniquely identifying string representation.
+        """
+        return self.__str__()
+
+
+class EnterpriseCatalogRoleAssignment(UserRoleAssignment):
+    """
+    Model to map users to an EnterpriseCatalogFeatureRole.
+     .. no_pii:
+    """
+
+    role_class = EnterpriseCatalogFeatureRole
+    enterprise_id = models.UUIDField(blank=True, null=True, verbose_name='Enterprise Customer UUID')
+
+    def get_context(self):
+        """
+        Return the enterprise customer id or `*` if the user has access to all resources.
+        """
+        if self.enterprise_id:
+            # converting the UUID('ee5e6b3a-069a-4947-bb8d-d2dbc323396c') to 'ee5e6b3a-069a-4947-bb8d-d2dbc323396c'
+            return str(self.enterprise_id)
+        return ACCESS_TO_ALL_ENTERPRISES_TOKEN
+
+    @classmethod
+    def user_assignments_for_role_name(cls, user, role_name):
+        """
+        Returns assignments for a given user and role name.
+        """
+        return cls.objects.filter(user__id=user.id, role__name=role_name)
+
+    def __str__(self):
+        """
+        Return human-readable string representation.
+        """
+        return "EnterpriseCatalogRoleAssignment(name={name}, user={user})".format(
+            name=self.role.name,  # pylint: disable=no-member
+            user=self.user.id,
+        )
+
+    def __repr__(self):
+        """
+        Return uniquely identifying string representation.
+        """
+        return self.__str__()
+
+
+def update_contentmetadata_from_discovery(catalog_query, dry_run=False):
+    """
+    Takes a CatalogQuery, uses cache or the Discovery API client to
+    retrieve associated metadata, and then creates/updates ContentMetadata objects.
+
+    Omits expired course runs from the updated metadata to match old
+    edx-enterprise implementation.
+
+    Args:
+        catalog_query (CatalogQuery): The catalog query to pass to discovery's /search/all endpoint.
+        dry_run (boolean): Logs rather than commits updated content metadata.
+    Returns:
+        list of str: Returns the content keys that were associated from the query results.
+    """
+
+    try:
+        # metadata will be an empty dict if unavailable from cache or API.
+        metadata = CatalogQueryMetadata(catalog_query).metadata
+    except Exception as exc:
+        LOGGER.exception(f'update_contentmetadata_from_discovery failed {catalog_query}')
+        raise exc
+
+    if not metadata:
+        return []
+
+    # associate content metadata with a catalog query only when we get valid results
+    # back from the discovery service. if metadata is `None`, an error occurred while
+    # calling discovery and we should not proceed with the below association logic.
+    metadata_content_keys = [get_content_key(entry) for entry in metadata]
+    LOGGER.info(
+        'Retrieved %d content items (%d unique) from course-discovery for catalog query %s',
+        len(metadata_content_keys),
+        len(set(metadata_content_keys)),
+        catalog_query,
+    )
+
+    associated_content_keys = associate_content_metadata_with_query(metadata, catalog_query, dry_run)
+    LOGGER.info(
+        'Associated %d content items (%d unique) with catalog query %s',
+        len(associated_content_keys),
+        len(set(associated_content_keys)),
+        catalog_query,
+    )
+
+    restricted_content_keys = synchronize_restricted_content(catalog_query, dry_run=dry_run)
+    return associated_content_keys + restricted_content_keys
+
+
+def synchronize_restricted_content(catalog_query, dry_run=False):
+    """
+    Fetch and assoicate any permitted restricted courses for the given catalog_query.
+    """
+    if not getattr(settings, 'SHOULD_FETCH_RESTRICTED_COURSE_RUNS', False):
+        return []
+
+    if not catalog_query.restricted_runs_allowed:
+        return []
+
+    restricted_course_keys = list(catalog_query.restricted_runs_allowed.keys())
+    content_filter = {
+        'content_type': COURSE,
+        'key': restricted_course_keys,
+    }
+    discovery_client = DiscoveryApiClient()
+    course_payload = discovery_client.retrieve_metadata_for_content_filter(
+        content_filter, QUERY_FOR_RESTRICTED_RUNS,
+    )
+
+    results = []
+    for course_dict in course_payload:
+        LOGGER.info('Storing restricted course %s for catalog_query %s', course_dict.get('key'), catalog_query.id)
+        if dry_run:
+            continue
+
+        RestrictedCourseMetadata.store_canonical_record(course_dict)
+        restricted_course_record = RestrictedCourseMetadata.store_record_with_query(
+            course_dict, catalog_query,
+        )
+        results.append(restricted_course_record.content_key)
+
+    restricted_course_run_keys = list(catalog_query.restricted_courses_by_run_key.keys())
+    run_content_filter = {
+        'content_type': COURSE_RUN,
+        'key': restricted_course_run_keys,
+    }
+    course_run_payload = discovery_client.retrieve_metadata_for_content_filter(
+        run_content_filter, QUERY_FOR_RESTRICTED_RUNS,
+    )
+    for course_run_dict in course_run_payload:
+        course_run_key = get_content_key(course_run_dict)
+        LOGGER.info(
+            'Storing restricted course run %s for catalog_query %s',
+            course_run_dict.get('key'), catalog_query.id,
+        )
+        if dry_run:
+            continue
+
+        # These are "top-level" course run dictionaries, which have aggregation_keys
+        # from which we can determine the parent course key.
+        course_run_record = RestrictedCourseMetadata.update_or_create_run(
+            course_run_key=course_run_key,
+            parent_content_key=get_parent_content_key(course_run_dict),
+            course_run_dict=course_run_dict,
+        )
+        results.append(course_run_record.content_key)
+    return results
+
+
+class CatalogUpdateCommandConfig(ConfigurationModel):
+    """
+    Model that specifies a ``force`` option
+    for all of the catalog-updating (or reindexing)
+    management commands.
+    """
+    force = models.BooleanField(
+        default=False,
+        help_text=_(
+            "If true, will force the command's underlying celery tasks "
+            "to run regardless of how recently the same task, on the same input, "
+            "has been successfully executed."
+        ),
+    )
+    no_async = models.BooleanField(
+        default=False,
+        help_text=_(
+            "If true, for management commands that respect this field, "
+            "celery tasks will not be apply_async()'d, but instead "
+            "exectue as regular python functions."
+        ),
+    )
+
+    @classmethod
+    def current_options(cls):
+        """
+        Returns a dictionary of options from this config model.
+        """
+        current_config = cls.current()
+        if current_config.enabled:
+            return {
+                'force': current_config.force,
+                'no_async': current_config.no_async,
+            }
+        return {}
+
+
+class ContentTranslation(TimeStampedModel):
+    """
+    Stores pre-computed translations for content metadata.
+
+    This model caches translations to improve Algolia indexing performance
+    by avoiding inline API calls during the indexing process.
+
+    .. no_pii:
+    """
+    content_metadata = models.ForeignKey(
+        ContentMetadata,
+        on_delete=models.CASCADE,
+        related_name='translations',
+        help_text=_("The content metadata this translation belongs to")
+    )
+    language_code = models.CharField(
+        max_length=10,
+        help_text=_("ISO 639-1 language code (e.g., 'es' for Spanish)")
+    )
+
+    # Translated fields
+    title = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text=_("Translated title")
+    )
+    short_description = models.TextField(
+        blank=True,
+        null=True,
+        help_text=_("Translated short description")
+    )
+    full_description = models.TextField(
+        blank=True,
+        null=True,
+        help_text=_("Translated full description")
+    )
+    outcome = models.TextField(
+        blank=True,
+        null=True,
+        help_text=_("Translated learning outcomes")
+    )
+    prerequisites = models.TextField(
+        blank=True,
+        null=True,
+        help_text=_("Translated prerequisites")
+    )
+    subtitle = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text=_("Translated subtitle")
+    )
+
+    # Metadata for change detection
+    source_hash = models.CharField(
+        max_length=64,
+        help_text=_("SHA256 hash of source content to detect changes")
+    )
 
     class Meta:
-        unique_together = ('facet_type', 'canonical_key')
-```
+        verbose_name = _("Content Translation")
+        verbose_name_plural = _("Content Translations")
+        app_label = 'catalog'
+        unique_together = ('content_metadata', 'language_code')
+        indexes = [
+            models.Index(fields=['content_metadata', 'language_code']),
+        ]
 
-#### B. Localized label table
-
-```python
-class FacetValueTranslation(models.Model):
-    """
-    Stores one label per locale per canonical facet value.
-    """
-    facet_value = models.ForeignKey(FacetValue, on_delete=models.CASCADE, related_name='translations')
-    language_code = models.CharField(max_length=10, db_index=True)
-    display_value = models.CharField(max_length=500)
-    normalized_display_value = models.CharField(max_length=500, db_index=True)
-    translation_source = models.CharField(max_length=20, default='ai')
-    review_status = models.CharField(max_length=20, default='approved')
-    checksum = models.CharField(max_length=64, blank=True, null=True)
-
-    class Meta:
-        unique_together = ('facet_value', 'language_code')
-```
-
-#### C. Optional sync / job tracking table
-
-```python
-class TranslationSyncJob(models.Model):
-    job_type = models.CharField(max_length=50)
-    language_code = models.CharField(max_length=10)
-    status = models.CharField(max_length=20)
-    started_at = models.DateTimeField(auto_now_add=True)
-    finished_at = models.DateTimeField(null=True, blank=True)
-    stats = models.JSONField(default=dict)
-```
-
-### Why this model is efficient
-
-Because it translates each canonical value **once per language**, not once per course or once per request.
-
-Example:
-
-```text
-Industry = fintech
-
-Translate once:
-  en → Financial Technology
-  es → Tecnología financiera
-  fr → Technologie financière
-
-Reuse that everywhere:
-  Skills Quiz
-  Search page
-  Recommendations
-  Analytics filters
-  Admin reports
-```
-
-### Recommended indexing contract for Algolia
-
-Each indexed record should contain both the stable key and the localized label.
-
-```json
-{
-  "industry": {
-    "key": "fintech",
-    "label": "Tecnología financiera"
-  },
-  "metadata_language": "es"
-}
-```
-
-Or for list facets:
-
-```json
-{
-  "industries": [
-    { "key": "fintech", "label": "Tecnología financiera" },
-    { "key": "healthcare", "label": "Atención médica" }
-  ],
-  "metadata_language": "es"
-}
-```
-
-If Algolia facet limitations require primitive strings for faceting, then index both:
-
-```json
-{
-  "industry_keys": ["fintech", "healthcare"],
-  "industry_labels": ["Tecnología financiera", "Atención médica"],
-  "metadata_language": "es"
-}
-```
-
-or a denormalized pair form appropriate for the query library in use.
-
-### Golden rule for logic safety
-
-Business logic must never depend on translated labels.
-
-Bad:
-
-```text
-if selectedIndustry == "Healthcare":
-```
-
-Good:
-
-```text
-if selectedIndustryKey == "healthcare":
-```
-
-That is what guarantees:
-
-- no regression in recommendation logic
-- no language-coupled bugs
-- no broken analytics when UI language changes
-
-### Generic backend flowchart
-
-```text
-            ┌─────────────────────────────────────┐
-            │ New source values arrive            │
-            │ (industry / skill / subject / etc.) │
-            └──────────────────┬──────────────────┘
-                               │
-                               ▼
-            ┌─────────────────────────────────────┐
-            │ Normalize to canonical keys         │
-            │ e.g. "Financial Technology"        │
-            │  -> "fintech"                      │
-            └──────────────────┬──────────────────┘
-                               │
-                               ▼
-            ┌─────────────────────────────────────┐
-            │ Upsert into FacetValue              │
-            └──────────────────┬──────────────────┘
-                               │
-                               ▼
-            ┌─────────────────────────────────────┐
-            │ For each supported locale           │
-            │ check FacetValueTranslation         │
-            └──────────────────┬──────────────────┘
-                               │
-                  ┌────────────┴────────────┐
-                  │                         │
-                  ▼                         ▼
-        translation exists          translation missing
-                  │                         │
-                  │                         ▼
-                  │            ┌──────────────────────────────┐
-                  │            │ Batch translate missing keys │
-                  │            └──────────────┬───────────────┘
-                  │                           │
-                  └──────────────┬────────────┘
-                                 │
-                                 ▼
-            ┌─────────────────────────────────────┐
-            │ Build localized Algolia objects     │
-            └──────────────────┬──────────────────┘
-                               │
-                               ▼
-            ┌─────────────────────────────────────┐
-            │ Frontend queries locale-aware data  │
-            └─────────────────────────────────────┘
-```
-
-### Recommended service boundaries
-
-To keep this generic, create services/modules like:
-
-- `FacetNormalizationService`
-- `FacetTranslationService`
-- `LocalizedIndexBuilder`
-- `LocaleAwareSearchConfigService`
-
-That way each new ticket becomes configuration, not reinvention.
-
----
-
-## 10. Industry Filter Example — Skills Quiz
-
-This is the concrete example for the ticket:
-
-> Within skills quiz, the Industry filter label, placeholder, and industry options are not translated.
-
-### What belongs to which layer
-
-| Item | Type | Correct implementation |
-|---|---|---|
-| `Industry` label | Static UI text | Frontend i18n message |
-| `Find an industry...` placeholder | Static UI text | Frontend i18n message |
-| Industry option values | Dynamic taxonomy data | Locale-aware Algolia data from DB-backed translations |
-| Selected industry behavior | Business logic | Use canonical industry key/ID |
-
-### AS-IS vs TO-BE for Industry
-
-```text
-AS-IS
------
-Frontend language = Spanish
-  ├─ label still says "Industry"
-  ├─ placeholder still says "Find an industry..."
-  ├─ options still say "Healthcare", "Technology"
-  └─ logic probably depends on raw Algolia label text
-
-TO-BE
------
-Frontend language = Spanish
-  ├─ label says "Industria"
-  ├─ placeholder says "Buscar una industria..."
-  ├─ options say "Atención médica", "Tecnología"
-  └─ selection stores canonical key such as healthcare / technology
-```
-
-### Recommended frontend contract for Industry filter
-
-```ts
-type LocalizedFacetOption = {
-  key: string;          // canonical business key, e.g. "healthcare"
-  label: string;        // localized UI label, e.g. "Atención médica"
-  locale: string;       // e.g. "es"
-};
-```
-
-The dropdown should render `label`, but the selection handler should persist `key`.
-
-### Skills Quiz flowchart
-
-```text
-Learner opens Skills Quiz
-          │
-          ▼
-Frontend reads active locale
-          │
-          ▼
-Locale-aware search config resolves Algolia query
-          │
-          ├─ English -> request EN data
-          └─ Spanish -> request ES data
-          │
-          ▼
-Dropdown receives industry options
-  [{ key: "healthcare", label: "Atención médica" }, ...]
-          │
-          ▼
-Learner types "aten"
-          │
-          ▼
-Algolia filters against Spanish labels
-          │
-          ▼
-Learner selects "Atención médica"
-          │
-          ▼
-Frontend stores selected key = "healthcare"
-          │
-          ▼
-Quiz logic / recommendation engine uses key = "healthcare"
-          │
-          ▼
-No change in recommendation logic, only display language changed
-```
-
-### Technical implementation checklist for Industry ticket
-
-#### Frontend
-
-In `frontend-app-skills`:
-
-1. Add static messages for:
-   - `Industry`
-   - `Find an industry...`
-2. Ensure the filter component receives `locale`
-3. Ensure the dropdown renders localized `label`
-4. Ensure the selected value passed to state/actions is the canonical `key`
-5. Ensure autosuggest search matches localized labels
-
-#### Backend / Search source
-
-1. Introduce industry canonical keys if they do not already exist
-2. Store per-locale industry labels in translation table
-3. Publish localized industry labels into Algolia
-4. Add locale-aware routing:
-   - either `metadata_language=<locale>` on a shared index
-   - or locale-specific index aliases
-5. Keep logic based on keys, not labels
-
-### Best-practice recommendation for all future filter tickets
-
-If there are many similar translation tickets coming, do **not** solve them one-by-one with hardcoded patches.
-
-Instead, implement a shared pattern:
-
-```text
-Shared Filter Translation Framework
-  ├─ canonical key service
-  ├─ translation table
-  ├─ locale-aware Algolia query builder
-  ├─ shared dropdown contract: { key, label }
-  └─ static UI string message catalogs
-```
-
-Once that framework exists, each new ticket becomes:
-
-```text
-Add new facet type
-  → define canonical keys
-  → load translations
-  → index localized labels
-  → render with shared dropdown
-```
-
-That is the most efficient path if translation work will continue across multiple features and multiple languages.
-
----
-
-*Document version: 2.0 | April 2026 | Based on code analysis of edx-enterprise, enterprise-catalog, frontend-enterprise, and frontend-app-learner-portal-enterprise as observed in workspace. v2.0: Added Mermaid architecture diagrams, fixed field_type derivation bug, added complete ALGOLIA_LOCALE_MAP with BCP-47 fallback chain, added Algolia scale impact to ADR-1, added _batch_translate implementation guide, added Phase 4 hard deployment dependency, reconciled TranslatedFacetCache vs FacetValueTranslation schema, added translation QA spot-check to Phase 5.*
+    def __str__(self):
+        """
+        Return human-readable string representation.
+        """
+        return f"<ContentTranslation: {self.content_metadata.content_key} - {self.language_code}>"
