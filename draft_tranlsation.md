@@ -89,52 +89,46 @@ The search page filters are powered by **Algolia** as the data backbone, deliver
 
 ### Data Flow Diagram (AS-IS)
 
-```
-User selects locale → (NO EFFECT on filters)
+```mermaid
+flowchart TD
+    subgraph ORIGIN["📦 DATA ORIGIN — course-discovery"]
+        CD[(course-discovery DB)]
+        CD -->|"json_metadata skills, subjects, level_type — English only"| JM[json_metadata English only]
+    end
 
-course-discovery
-  └─► json_metadata.subjects = ["Computer Science", "Data Analysis"]  (English only)
-  └─► json_metadata.skill_names = ["Machine Learning", "Python"]      (English only)
-  └─► json_metadata.level_type = "Introductory"                       (English only)
+    subgraph CATALOG["⚙️ INDEXING PIPELINE — enterprise-catalog"]
+        JM --> EN_OBJ["English Algolia Object\nobjectID: course-v1:edX+...\nmetadata_language: en\nskill_names: Machine Learning\nsubjects: Computer Science"]
+        JM --> XPERT["Xpert AI\ntranslate_skills_or_subjects\n⚠️ Called per course at index time\nSpanish ONLY"]
+        XPERT --> ES_OBJ["Spanish Algolia Object\nobjectID: course-v1:edX+...-es\nmetadata_language: es\nskill_names: Aprendizaje Automático"]
+    end
 
-enterprise-catalog  reindex_algolia
-  ├─► English objects: skill_names=["Machine Learning"],
-  │                    subjects=["Computer Science"],
-  │                    level_type="Introductory",
-  │                    objectID="course-v1:edX+DemoX+2024",
-  │                    metadata_language="en"
-  │
-  └─► Spanish objects (via create_spanish_algolia_object):
-        skill_names = translate_skills_or_subjects(...)  ← Xpert AI REALTIME call
-        subjects    = translate_skills_or_subjects(...)  ← Xpert AI REALTIME call
-        level_type  = LEVEL_TYPE_TRANSLATIONS dict lookup
-        objectID    = "course-v1:edX+DemoX+2024-es"
-        metadata_language = "es"
+    subgraph ALGOLIA["🔍 ALGOLIA INDEX — Single index, all languages mixed"]
+        EN_OBJ --> IDX[("Algolia Index\nEnglish + Spanish objects co-indexed")]
+        ES_OBJ --> IDX
+    end
 
-Algolia Index (single index, ALL languages mixed):
-  Object 1: { objectID: "course-v1:...", metadata_language: "en", skills: ["Machine Learning"] }
-  Object 2: { objectID: "course-v1:...-es", metadata_language: "es", skills: ["Aprendizaje Automático"] }
+    subgraph PKG["📦 @edx/frontend-enterprise-catalog-search"]
+        FDD["FacetDropdown.jsx\n❌ title = raw string e.g. 'Skills'"]
+        FI["FacetItem.jsx\n✅ Level options translated\n❌ Skills/Subject NOT in messages.js"]
+        TYPH["TypeaheadFacetDropdown.jsx\n❌ placeholder = 'Find a skill...'"]
+        MSG["messages.js\n✅ Level, Availability, Language, Learning Type\n❌ Filter titles, Skills, Subjects MISSING"]
+    end
 
-Frontend (frontend-app-learner-portal-enterprise):
-  useAlgoliaSearch → uses SINGLE index, NO locale filter applied
-  All objects from all languages shown in facets
+    subgraph FRONTEND["🖥️ frontend-app-learner-portal-enterprise"]
+        HOOK["useAlgoliaSearch\n❌ No metadata_language filter\nShows ALL languages in facets"]
+        SP["SearchPage.jsx\nPasses raw English title strings"]
+    end
 
-  SearchFilters renders facet titles from:
-    SEARCH_FACET_FILTERS[i].title = "Skills"      ← Raw English string, NO intl()
-    SEARCH_FACET_FILTERS[i].title = "Subject"     ← Raw English string, NO intl()
-    SEARCH_FACET_FILTERS[i].title = "Level"       ← Raw English string, NO intl()
-    typeaheadOptions.placeholder  = "Find a skill..." ← Raw English, NO intl()
+    IDX -->|"Returns ALL language objects — no locale filter"| HOOK
+    HOOK --> SP
+    SP --> FDD & FI & TYPH
+    FDD & FI -.->|"lookup"| MSG
 
-  FacetItem renders dropdown options:
-    messages["Introductory"] → intl.formatMessage(...)  ✅ TRANSLATED (Level)
-    messages["Available Now"] → intl.formatMessage(...) ✅ TRANSLATED (Availability)
-    messages["course"] → intl.formatMessage(...)        ✅ TRANSLATED (Learning Type)
-    messages["Computer Science"] → NOT IN messages.js   ❌ RAW ENGLISH (Subject)
-    messages["Machine Learning"] → NOT IN messages.js   ❌ RAW ENGLISH (Skills)
-
-  LearningTypeRadioFacet:
-    <FormattedMessage id="search.facetFilters.learningType.title" .../>  ✅ TRANSLATED
-    <FormattedMessage id="search.facetFilters.learningType.courses" .../> ✅ TRANSLATED
+    style CATALOG fill:#fff3e0,stroke:#FF9800
+    style ALGOLIA fill:#f3e5f5,stroke:#9C27B0
+    style PKG fill:#e8f5e9,stroke:#4CAF50
+    style FRONTEND fill:#fce4ec,stroke:#E91E63
+    style XPERT fill:#ffebee,stroke:#f44336
 ```
 
 ### Layer-by-Layer Analysis
@@ -207,53 +201,52 @@ Priority | Filter      | What's broken
 
 ### Data Flow Diagram (TO-BE)
 
-```
-User selects locale (e.g. fr, ar, zh-CN, pt-br)
-           │
-           ▼
-frontend-app-learner-portal-enterprise
-  useAlgoliaSearch(locale)
-      │
-      ├─► locale === 'en' → query Algolia with filter: metadata_language='en'
-      │                      OR omit filter (default behaviour)
-      │
-      └─► locale === 'fr' → query Algolia with filter: metadata_language='fr'
-                             (facet values for skills/subjects come pre-translated)
+```mermaid
+flowchart TD
+    subgraph ORIGIN["📦 DATA ORIGIN — course-discovery"]
+        CD[(course-discovery DB)]
+        CD -->|"English json_metadata"| JM[json_metadata]
+    end
 
-Algolia index (ALL languages co-exist, differentiated by metadata_language):
-  { objectID: "...", metadata_language: "en", skill_names: ["Machine Learning"] }
-  { objectID: "...-fr", metadata_language: "fr", skill_names: ["Apprentissage automatique"] }
-  { objectID: "...-ar", metadata_language: "ar", skill_names: ["التعلم الآلي"] }
-  { objectID: "...-zh", metadata_language: "zh", skill_names: ["机器学习"] }
+    subgraph CACHE["🗄️ NEW: Translation Tables"]
+        TFC["TranslatedFacetCache\nenglish_value + field_type + language_code → translated_value\nOne entry per unique value per locale"]
+        CT["ContentTranslation\ncontent_key + language_code → title, description\nGeneralized from Spanish-only"]
+    end
 
-Backend (enterprise-catalog) — Multi-Language Pipeline:
-  ContentTranslation table: { content_key, language_code, title, description, ... }
-  TranslatedFacetCache table (NEW): { english_value, field_type, language_code, translated_value }
+    subgraph PIPELINE["⚙️ INDEXING PIPELINE — enterprise-catalog"]
+        JM --> CMD["populate_translations cmd\nWeekly cron\n1. Collect unique skills and subjects\n2. Check cache for misses\n3. Batch Xpert AI for misses only\n4. Write to TranslatedFacetCache"]
+        CMD -->|"cache misses only"| XPERT_BATCH["Xpert AI\nBatch 50 items per call\n20 locales × unique values"]
+        XPERT_BATCH -->|"write results"| TFC
+        TFC --> INDEXER["create_localized_algolia_object\nlanguage_code = fr / ar / zh / de ..."]
+        CT --> INDEXER
+        JM --> INDEXER
+        INDEXER --> ALGOLIA_OBJ["20 Locale Algolia Objects per course\nobjectID: course-...-fr  metadata_language: fr\nsubjects: Informatique\nskill_names: Apprentissage automatique"]
+    end
 
-  populate_translations management command:
-    ├── For each ContentMetadata object
-    ├── For each target language: ['es','fr','ar','zh','pt-br','de','ja','ko',...]
-    ├── Fetch title/description via Xpert AI → store in ContentTranslation
-    └── For skill_names and subjects:
-          Look up TranslatedFacetCache first
-          If cache miss → call Xpert AI → store in TranslatedFacetCache
-          (Same skill never translated twice, across all content)
+    subgraph ALGOLIA["🔍 ALGOLIA — Single index, 20 locales co-indexed"]
+        ALGOLIA_OBJ --> IDX[("Algolia Index\nDifferentiated by metadata_language")]
+    end
 
-Shared package (frontend-enterprise-catalog-search):
-  SEARCH_FACET_FILTERS:
-    title now uses message IDs, resolved via intl at render time
+    subgraph PKG["📦 @edx/frontend-enterprise-catalog-search — UPDATED"]
+        MSG2["messages.js\n✅ Filter titles + placeholders + subjects\nPushed to openedx-translations"]
+        FDD2["FacetDropdown.jsx\n✅ intl.formatMessage for title"]
+        FI2["FacetItem.jsx — UNCHANGED\n✅ Skills pre-translated from Algolia\n✅ Subjects now in messages.js"]
+    end
 
-  FacetDropdown.jsx:
-    <Dropdown.Toggle>{intl.formatMessage(titleMessages[title])}</Dropdown.Toggle>
+    subgraph FRONTEND["🖥️ frontend-app-learner-portal-enterprise — UPDATED"]
+        HOOK2["useAlgoliaSearch\n✅ resolveAlgoliaLocale\n✅ baseFilter = metadata_language: fr"]
+        SP2["SearchPage.jsx\nConfigure filters = baseFilter"]
+    end
 
-  TypeaheadFacetDropdown.jsx:
-    placeholder={intl.formatMessage(placeholderMessages[attribute])}
-    aria-label={intl.formatMessage(ariaLabelMessages[attribute])}
+    IDX -->|"Returns ONLY fr objects when locale=fr"| HOOK2
+    HOOK2 --> SP2 --> FDD2 & FI2
+    FDD2 & FI2 -.->|"lookup"| MSG2
 
-  FacetItem.jsx (unchanged, already works):
-    {messages[item.label] ? intl.formatMessage(messages[item.label]) : item.label}
-    ← Subject values added to messages.js
-    ← Skills: value comes pre-translated from Algolia (no lookup needed)
+    style CACHE fill:#e3f2fd,stroke:#1565C0,stroke-width:2px
+    style PIPELINE fill:#fff3e0,stroke:#FF9800
+    style ALGOLIA fill:#f3e5f5,stroke:#9C27B0
+    style PKG fill:#e8f5e9,stroke:#4CAF50
+    style FRONTEND fill:#fce4ec,stroke:#E91E63
 ```
 
 ### Design Principles
@@ -280,6 +273,34 @@ Shared package (frontend-enterprise-catalog-search):
 | **Subject** options | Algolia, semi-static | ~50–100 | Quarterly | `messages.js` static lookup (Phase 2) + pre-indexed (Phase 4) |
 | **Skills** options | Algolia, fully dynamic | 5,000–50,000 | Weekly | Pre-indexed translated values from `TranslatedFacetCache` (Phase 4) |
 | **Ability** options | TBD — confirm source | TBD | TBD | Identify first; apply matching strategy |
+
+**Classification decision tree:**
+
+```mermaid
+flowchart LR
+    Q1{{"Is it a UI label\nor placeholder?"}}
+    Q2{{"Fixed small set?\nIntroductory, Available Now"}}
+    Q3{{"Stable enumerable?\nSubjects: up to 100"}}
+    Q4{{"Fully dynamic?\nSkills: 5k-50k"}}
+
+    S1["Strategy 1\n🔤 defineMessages\nFacetDropdown.jsx\nTypeaheadFacetDropdown.jsx"]
+    S2["Strategy 2\n📋 messages.js lookup\nFacetItem.jsx already works\n✅ Level / Availability done"]
+    S3["Strategy 3\n📖 Enumerate → messages.js\nPush to openedx-translations\nPhase 2"]
+    S4["Strategy 4\n🤖 AI pre-index\nTranslatedFacetCache\ncreate_localized_algolia_object\nPhase 3"]
+
+    Q1 -->|Yes| S1
+    Q1 -->|No| Q2
+    Q2 -->|Yes| S2
+    Q2 -->|No| Q3
+    Q3 -->|Yes| S3
+    Q3 -->|No| Q4
+    Q4 -->|Yes| S4
+
+    style S1 fill:#e8f5e9,stroke:#388E3C
+    style S2 fill:#e3f2fd,stroke:#1565C0
+    style S3 fill:#fff3e0,stroke:#F57C00
+    style S4 fill:#fce4ec,stroke:#C62828
+```
 
 ---
 
@@ -540,6 +561,8 @@ class TranslatedFacetCache(TimeStampedModel):
 
 ```python
 # algolia_utils.py
+import copy  # required — add to module-level imports
+
 def create_localized_algolia_object(algolia_object, content_metadata, language_code):
     """
     Replaces create_spanish_algolia_object.
@@ -579,10 +602,13 @@ def _translate_facet_values_from_cache(obj, language_code):
         if not values:
             continue
 
+        # Explicit field→type map avoids fragile string manipulation
+        FIELD_TYPE_MAP = {'skill_names': 'skill', 'subjects': 'subject'}
+
         # Bulk fetch all needed translations at once
         cache_hits = TranslatedFacetCache.objects.filter(
             english_value__in=values,
-            field_type=field.rstrip('s').replace('_names', ''),  # 'skill' or 'subject'
+            field_type=FIELD_TYPE_MAP[field],
             language_code=language_code,
         ).values_list('english_value', 'translated_value')
 
@@ -591,6 +617,35 @@ def _translate_facet_values_from_cache(obj, language_code):
 ```
 
 **Sub-approach C: New management command `populate_translations_all_languages`**
+
+**Batch job flow:**
+
+```mermaid
+flowchart TD
+    START([Weekly cron: populate_translations]) --> COLLECT["Collect unique skill_names + subjects\nDB-level JSON extraction\nSELECT DISTINCT jsonb_array_elements_text"]
+    COLLECT --> LOCALE_LOOP["For each target locale\nes fr ar zh-cn de ja ko pt-br..."]
+    LOCALE_LOOP --> CACHE_Q["Query TranslatedFacetCache\nfor existing translations"]
+    CACHE_Q --> MISS{{"Cache misses?"}}
+    MISS -->|"No misses"| NEXT_LOCALE["Next locale"]
+    MISS -->|"Misses found"| BATCH["Split into batches of 50"]
+    BATCH --> AI["Xpert AI batch_translate\nSingle prompt per batch\nJSON array response"]
+    AI --> PARSED{{"Parse OK?"}}
+    PARSED -->|"Yes"| WRITE["bulk_create TranslatedFacetCache\nsource=xpert_ai"]
+    PARSED -->|"Error"| FALLBACK["Keep English value\nLog to Datadog for QA"]
+    FALLBACK --> WRITE
+    WRITE --> MORE{{"More batches?"}}
+    MORE -->|"Yes"| BATCH
+    MORE -->|"No"| NEXT_LOCALE
+    NEXT_LOCALE --> DONE{{"All locales done?"}}
+    DONE -->|"No"| LOCALE_LOOP
+    DONE -->|"Yes"| REINDEX["reindex_algolia\ncreate_localized_algolia_object\nfor each locale"]
+    REINDEX --> END(["Algolia updated\n20+ languages live"])
+
+    style START fill:#c8e6c9,stroke:#388E3C
+    style END fill:#c8e6c9,stroke:#388E3C
+    style FALLBACK fill:#ffebee,stroke:#f44336
+    style WRITE fill:#e3f2fd,stroke:#1565C0
+```
 
 ```python
 class Command(BaseCommand):
@@ -627,10 +682,23 @@ class Command(BaseCommand):
             self._translate_and_cache('subject', all_subjects, lang, batch_size)
 
     def _collect_unique_values(self, field_name):
-        """Extract unique skill/subject values from all ContentMetadata."""
+        """
+        Extract unique skill/subject values from all ContentMetadata.
+
+        Performance note: iterating all records in Python is O(N) memory.
+        For large catalogs (100k+ records) prefer a DB-level JSON extraction:
+
+            SELECT DISTINCT jsonb_array_elements_text(
+                json_metadata -> %s
+            ) FROM catalog_contentmetadata;
+
+        The Python fallback below is correct but should only be used on
+        smaller datasets or during bootstrap. Implement the raw SQL path
+        using django.db.connection.cursor() before deploying to production.
+        """
         from enterprise_catalog.apps.catalog.models import ContentMetadata
         values = set()
-        for cm in ContentMetadata.objects.iterator():
+        for cm in ContentMetadata.objects.only('json_metadata').iterator(chunk_size=2000):
             items = (cm.json_metadata or {}).get(field_name, [])
             values.update(items)
         return list(values)
@@ -664,6 +732,33 @@ class Command(BaseCommand):
                 for en, tr in zip(batch, translated)
             ]
             TranslatedFacetCache.objects.bulk_create(objs, ignore_conflicts=True)
+
+    def _batch_translate(self, values: list[str], language_code: str) -> list[str]:
+        """
+        Translate a batch of English strings to language_code via Xpert AI.
+
+        Contract: returns a list of translated strings in the same order
+        as `values`. If the API call fails for any item, return the
+        original English string for that position (never raise).
+
+        Implementation guide:
+          1. Build a single prompt asking Xpert AI to translate all items
+             in a JSON array (e.g. ["Python", "Machine Learning", ...]).
+          2. Request the response as a JSON array in the same order.
+          3. Parse the response; fall back to English on parse failure.
+          4. Add exponential-backoff retry (max 3 attempts).
+          5. Log any per-item fallbacks to Datadog for translation QA.
+
+        Example prompt template:
+          "Translate the following technical terms to {language}.
+           Return ONLY a JSON array of strings in the same order.
+           Terms: {json.dumps(values)}"
+        """
+        from enterprise_catalog.apps.catalog.xpert_ai import chat_completion  # noqa: PLC0415
+        # TODO: implement prompt construction and response parsing
+        raise NotImplementedError(
+            "_batch_translate must be implemented before production use"
+        )
 ```
 
 ---
@@ -679,22 +774,62 @@ The frontend must tell Algolia which language to return facet values in, by filt
 // useAlgoliaSearch.ts
 import { useIntl } from '@edx/frontend-platform/i18n';
 
+/**
+ * Maps BCP-47 locale codes (as returned by @edx/frontend-platform/i18n)
+ * to the backend language_code values stored in Algolia metadata_language.
+ *
+ * MUST stay in sync with SUPPORTED_LOCALES in populate_translations.py.
+ * Regional variants (e.g. es-419) map to their base locale ('es') so that
+ * a single Algolia object serves all regional users.
+ *
+ * Fallback chain:  specific-variant → base-locale → 'en'
+ * e.g. 'zh-tw' → 'zh-cn' → 'en'  (if zh-tw not explicitly mapped)
+ */
 const ALGOLIA_LOCALE_MAP: Record<string, string> = {
-  'en': 'en',
-  'es-419': 'es',
-  'fr': 'fr',
-  'ar': 'ar',
-  'zh-cn': 'zh-cn',
-  'ja': 'ja',
-  'ko': 'ko',
-  'pt-br': 'pt-br',
-  'de': 'de',
-  // ... all 20+ supported locales mapped to their backend language_code equivalent
+  'en':      'en',
+  'en-us':   'en',
+  'es':      'es',
+  'es-419':  'es',
+  'es-es':   'es',
+  'fr':      'fr',
+  'fr-ca':   'fr',
+  'ar':      'ar',
+  'zh-cn':   'zh-cn',
+  'zh-tw':   'zh-cn',  // serve zh-cn until zh-tw index is bootstrapped
+  'ja':      'ja',
+  'ko':      'ko',
+  'pt-br':   'pt-br',
+  'pt':      'pt-br',
+  'de':      'de',
+  'ru':      'ru',
+  'it':      'it',
+  'nl':      'nl',
+  'pl':      'pl',
+  'tr':      'tr',
+  'vi':      'vi',
+  'th':      'th',
+  'id':      'id',
+  'hi':      'hi',
+  'sv':      'sv',
+  'uk':      'uk',
+  'he':      'he',
 };
+
+/** Resolve BCP-47 locale to Algolia language_code with fallback to 'en'. */
+function resolveAlgoliaLocale(locale: string): string {
+  const lower = locale.toLowerCase();
+  // 1. Exact match
+  if (ALGOLIA_LOCALE_MAP[lower]) return ALGOLIA_LOCALE_MAP[lower];
+  // 2. Base-language match (e.g. 'fr-BE' → 'fr')
+  const base = lower.split('-')[0];
+  if (ALGOLIA_LOCALE_MAP[base]) return ALGOLIA_LOCALE_MAP[base];
+  // 3. Fallback
+  return 'en';
+}
 
 export const useAlgoliaSearch = () => {
   const { locale } = useIntl();
-  const algoliaLocale = ALGOLIA_LOCALE_MAP[locale] ?? 'en';
+  const algoliaLocale = resolveAlgoliaLocale(locale);
 
   // Add metadata_language filter to Algolia queries
   const baseFilter = `metadata_language:'${algoliaLocale}'`;
@@ -810,8 +945,14 @@ Deliverable: Algolia index contains translated objects for all 20 locales
 PHASE 4 — Frontend Locale Routing (1–2 weeks)
 Effort: Low | Impact: Critical | Risk: Low
 ──────────────────────────────────────────────────────────────────
+DEPENDENCY: Phase 3 backend must be fully deployed AND at least one
+non-English locale must be completely indexed in Algolia before this
+phase is user-visible. Deploying the frontend locale filter against
+an index that only has English objects will return zero results for
+non-English users. Coordinate release with enterprise-catalog deploy.
+
 Repo: frontend-app-learner-portal-enterprise
-  □ Add ALGOLIA_LOCALE_MAP constant
+  □ Add ALGOLIA_LOCALE_MAP constant and resolveAlgoliaLocale() helper
   □ Update useAlgoliaSearch to derive metadata_language filter from locale
   □ Pass filter to Algolia <Configure> component
   □ Test locale switching fully refreshes all facet options
@@ -834,6 +975,27 @@ Effort: Medium | Impact: High | Risk: Low
 ---
 
 ## 6. Repository Touchpoints
+
+**Deployment dependency order:**
+
+```mermaid
+flowchart TD
+    FE["openedx/frontend-enterprise\nmessages.js + components updated"]
+    TRANS["openedx-translations\ni18n_extract → Transifex → 20+ locale .json"]
+    EC["enterprise-catalog\nTranslatedFacetCache + generalized pipeline"]
+    BOOTSTRAP["Bootstrap run\npopulate_translations + reindex_algolia\nfor es fr ar"]
+    PORTAL["frontend-app-learner-portal-enterprise\nuseAlgoliaSearch locale routing"]
+
+    FE -->|"npm publish v12.x"| PORTAL
+    FE -->|"i18n_extract"| TRANS
+    TRANS -->|"build-time locale files"| PORTAL
+    EC --> BOOTSTRAP
+    BOOTSTRAP -->|"HARD DEPENDENCY\nindex must be populated first"| PORTAL
+    EC -->|"Phase 3 before Phase 4"| PORTAL
+
+    style BOOTSTRAP fill:#ffcc80,stroke:#E65100,stroke-width:2px
+    style PORTAL fill:#f3e5f5,stroke:#6A1B9A
+```
 
 | Repository | Files to modify | Change type |
 |---|---|---|
@@ -864,6 +1026,14 @@ Effort: Medium | Impact: High | Risk: Low
 - Managing 20× replica configs, rules, and synonyms is operationally complex
 - Single index with `metadata_language` filter achieves the same isolation cleanly
 - Already the direction the existing Spanish implementation uses (`metadata_language='es'`)
+
+**Algolia object count impact (must be planned for):**
+
+With 100,000 content items and 20 locales the index grows to ~2,000,000 objects. Before enabling all locales:
+1. Confirm current Algolia plan record limit and request an upgrade if needed
+2. Measure index build time: a 2M-object reindex may take 4–6 hours on a background worker
+3. Stage the rollout: enable 3–5 priority locales first, then expand incrementally
+4. Index only locales for which `ContentTranslation` rows exist (skip rather than write English duplicates)
 
 ---
 
@@ -1027,6 +1197,9 @@ This classification prevents over-engineering and makes new tickets predictable.
 ---
 
 ## 9. Efficient Backend-Centric Translation Model
+
+> **Relationship to `TranslatedFacetCache` (Section 4):**  
+> Section 4 introduces `TranslatedFacetCache` — a lightweight string-keyed cache sufficient to unblock Phase 3 delivery quickly. The normalized `FacetValue` + `FacetValueTranslation` schema described below is the **long-term target**. They are not competing designs; `TranslatedFacetCache` is the pragmatic Phase 3 table that should be **migrated into** the normalized schema once the broader framework is in place. In the interim, the two tables serve the same query contract and the indexing code must not reference both simultaneously.
 
 If many translation tickets are expected, the most efficient long-term design is to make the database the **source of truth for dynamic translated labels**.
 
@@ -1382,4 +1555,4 @@ That is the most efficient path if translation work will continue across multipl
 
 ---
 
-*Document version: 1.0 | April 2026 | Based on code analysis of edx-enterprise, enterprise-catalog, frontend-enterprise, and frontend-app-learner-portal-enterprise as observed in workspace.*
+*Document version: 2.0 | April 2026 | Based on code analysis of edx-enterprise, enterprise-catalog, frontend-enterprise, and frontend-app-learner-portal-enterprise as observed in workspace. v2.0: Added Mermaid architecture diagrams, fixed field_type derivation bug, added complete ALGOLIA_LOCALE_MAP with BCP-47 fallback chain, added Algolia scale impact to ADR-1, added _batch_translate implementation guide, added Phase 4 hard deployment dependency, reconciled TranslatedFacetCache vs FacetValueTranslation schema, added translation QA spot-check to Phase 5.*
