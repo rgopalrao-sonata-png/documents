@@ -28,9 +28,11 @@
 
 The BFF layer in `enterprise_access/apps/bffs/handlers.py` collapses multiple licenses to a single one at **4 primary bottlenecks**. In addition, there is a **5th continuity gap** during subscription expiration: a learner can still be downgraded to audit if the expiring license was the one originally associated with the enrollment.
 
+There is also an **overlapping-catalog enrollment attribution problem**: if a course exists in multiple catalogs and the learner has multiple applicable subscription licenses, the legacy behavior can effectively anchor the enrollment record to the **first activated applicable license**, rather than the best license for continuity and entitlement correctness.
+
 **Root cause:** Selection happens too early (data layer), losing information needed for downstream decisions.
 
-**Fix:** Defer selection to course context, preserve the full collection through every layer, and add post-expiration remediation for enrollments affected by expiring plans.
+**Fix:** Defer selection to course context, preserve the full collection through every layer, explicitly choose the enrollment license at course-enrollment time, persist that chosen `license_uuid`, and add post-expiration remediation for enrollments affected by expiring plans.
 
 ---
 
@@ -248,6 +250,8 @@ flowchart TD
     style ShowAccess fill:#a5d6a7,stroke:#388e3c,stroke-width:3px
     style NoAccess fill:#ffcdd2,stroke:#c62828
 ```
+
+  **Architectural intent:** this algorithm explicitly replaces the legacy “first activated applicable license wins” behavior. For courses that appear in multiple catalogs, the enrollment record must be attributed to the `best_license` selected in course context, not whichever applicable license happened to be activated first.
 
 ---
 
@@ -480,7 +484,9 @@ def _map_courses_to_licenses(self, enrollment_intentions):
 
     Algorithm:
     1. For each course, find ALL licenses whose catalog contains the course.
-    2. If multiple match, apply deterministic tie-breaker:
+   2. If multiple match, apply deterministic tie-breaker.
+     IMPORTANT: do NOT rely on "first activated license wins" as the
+     primary rule for overlapping catalogs.
        a. Latest expiration_date  (maximize access window)
        b. Most recent activation_date  (prefer newer)
        c. UUID lexical order DESC  (deterministic fallback)
@@ -567,6 +573,20 @@ def _map_courses_to_single_license(self, enrollment_intentions):
             mappings[intention['course_run_key']] = current_license['uuid']
     return mappings
 ```
+
+  #### 2.2.1 Overlapping-Catalog Enrollment Attribution
+
+  When a course is present in multiple enterprise catalogs and the learner has more than one applicable subscription license, the target architecture must **persist the selected license UUID at enrollment time**.
+
+  | Behavior | Legacy | Target |
+  |---|---|---|
+  | Enrollment attribution | First activated applicable license can win implicitly | `selectBestLicense` decides explicitly in course context |
+  | Enrollment record linkage | Coupled to activation order | Coupled to chosen `license_uuid` for that course |
+  | Continuity outcome | Can bind learner to shorter-lived license | Prefers longer-lived license and reduces future downgrades |
+
+  **Required rule:** the BFF must send the chosen `license_uuid` on the redeem/enroll path for every enrollment attempt. The enrollment record should therefore reflect the explicit course-context decision, not incidental activation order.
+
+  **Important:** this means the architecture *does* take care of the “first activated license” issue by replacing it, not by preserving it.
 
 ---
 
@@ -1433,7 +1453,7 @@ export function shouldUpgradeUserEnrollment({
 #### Part 1 — Preventive (already in spec)
 
 `selectBestLicense` picks the license with **latest expiration** at enrollment time.
-New enrollments are automatically attached to the longest-lived license.
+New enrollments are automatically attached to the longest-lived applicable license, even when the course exists in multiple catalogs and multiple activated licenses match.
 **Document this explicitly as the primary protection mechanism.**
 
 #### Part 2 — Reactive (NEW: Post-Expiration Remediation Task)
@@ -1444,7 +1464,7 @@ covering the same course.
 
 ```mermaid
 flowchart TD
-    A[Kafka Event: SubscriptionPlanExpired] --> B[Celery Task: remediate_enrollment_downgrades_for_expired_plan]
+  A[Expiration signal or reconciliation trigger] --> B[Celery Task: remediate_enrollment_downgrades_for_expired_plan]
     B --> C[Fetch all learners on expired plan]
     C --> D[For each learner: fetch other ACTIVATED isCurrent licenses]
   D --> E{Other active<br/>licenses exist?}
@@ -1471,7 +1491,7 @@ def remediate_enrollment_downgrades_for_expired_plan(self, expired_plan_uuid, en
     Post-expiration remediation: re-upgrade enrollments to verified where the
     learner has another active license covering the same course.
 
-    Triggered by Kafka event: openedx.enterprise.license_manager.subscription_plan.expired
+  Triggered by an expiration signal/event or a reconciliation job.
     """
     lm_client = LicenseManagerApiClient()
     enterprise_client = EnterpriseApiClient()
