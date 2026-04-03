@@ -6,10 +6,10 @@ TOKEN_URL = "http://localhost:18000/oauth2/access_token/"
 
 USERS = [
     ("test-multi-alice",  "edx"),
-    ("test-multi-bob",    "edx1234"),
+    ("test-multi-bob",    "edx"),
     ("test-multi-carol",  "edx1234"),
-    ("test-multi-dave",   "edx1234"),
-    ("test-multi-eve",    "edx1234"),
+    ("test-multi-dave",   "edx"),
+    ("test-multi-eve",    "edx"),
 ]
 
 def get_token(username, password):
