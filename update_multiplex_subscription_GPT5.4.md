@@ -1485,110 +1485,94 @@ flowchart LR
 New enrollments are automatically attached to the longest-lived applicable license, even when the course exists in multiple catalogs and multiple activated licenses match.
 **Document this explicitly as the primary protection mechanism.**
 
-#### Part 2 — Reactive (NEW: Post-Expiration Remediation Task)
+#### Part 2 — Reactive (IMPLEMENTED: Re-upgrade inside existing license assignment task)
 
-A new Celery task in `enterprise-access` triggers after a plan expires. It
-re-upgrades any downgraded enrollments where the learner has another active license
-covering the same course.
+> **Implementation decision:** Rather than adding a new standalone Celery task and signal handler,
+> the re-upgrade logic was incorporated into the **existing**
+> `update_license_requests_after_assignments_task` in `enterprise_access/apps/api/tasks.py`.
+> This task already fires every time an admin approves a license request and has access to the
+> exact `license_uuid` and `course_id` needed — no new files or signals required.
+
+When a subscription plan expires, license-manager downgrades the learner's enrollment to audit
+mode. If the admin subsequently approves a new `LicenseRequest` for the same learner and course,
+the task now immediately calls `bulk_enroll_enterprise_learners` with the new `license_uuid`,
+re-upgrading the enrollment back to verified.
 
 ```mermaid
 flowchart TD
-  A[Expiration signal or reconciliation trigger] --> B[Celery Task: remediate_enrollment_downgrades_for_expired_plan]
-    B --> C[Fetch all learners on expired plan]
-    C --> D[For each learner: fetch other ACTIVATED isCurrent licenses]
-  D --> E{Other active<br/>licenses exist?}
-  E -->|No| F[Leave in audit<br/>No action]
-    E -->|Yes| G[Build catalog index from surviving licenses]
-    G --> H[For each downgraded enrollment: check catalog match]
-  H --> I{Course covered<br/>by surviving license?}
-    I -->|No| F
-    I -->|Yes| J[Call Enterprise Enrollment API: re-upgrade to verified]
-    J --> K[Log remediation event]
-    K --> L[Learner restored to verified mode]
+  A[Admin approves LicenseRequest] --> B[assign_licenses_task assigns license in License Manager]
+  B --> C[update_license_requests_after_assignments_task]
+  C --> D[bulk_update: set state=APPROVED, license_uuid on LicenseRequest]
+  D --> E[For each APPROVED request with course_id + license_uuid]
+  E --> F{Enrollment<br/>in audit mode?}
+  F -->|Yes| G[bulk_enroll_enterprise_learners<br/>with new license_uuid]
+  F -->|No| H[No action needed]
+  G --> I[Enrollment re-upgraded to verified]
+  G --> J[Log success]
 
-    style J fill:#51cf66,stroke:#2f9e44,color:#fff
-    style L fill:#c8e6c9,stroke:#388e3c
-    style F fill:#ffcdd2,stroke:#c62828
+  style G fill:#51cf66,stroke:#2f9e44,color:#fff
+  style I fill:#c8e6c9,stroke:#388e3c
+  style H fill:#e3f2fd,stroke:#1565c0
 ```
 
-**New task — `enterprise_access/apps/bffs/tasks.py`:**
+**Updated task — `enterprise_access/apps/api/tasks.py` (`update_license_requests_after_assignments_task`):**
 
 ```python
-@shared_task(bind=True, max_retries=3)
-def remediate_enrollment_downgrades_for_expired_plan(self, expired_plan_uuid, enterprise_customer_uuid):
+@shared_task(base=LoggedTaskWithRetry)
+def update_license_requests_after_assignments_task(license_assignment_results):
     """
-    Post-expiration remediation: re-upgrade enrollments to verified where the
-    learner has another active license covering the same course.
-
-  Triggered by an expiration signal/event or a reconciliation job.
+    Update license requests after license assignments.
+    Also re-upgrades any audit-mode enrollments for newly approved learners (ENT-11672).
     """
-    lm_client = LicenseManagerApiClient()
-    enterprise_client = EnterpriseApiClient()
+    # ... existing state-update logic unchanged ...
+    LicenseRequest.bulk_update(license_requests, ['state', 'subscription_plan_uuid', 'license_uuid'])
 
-    affected_learners = lm_client.get_learners_for_expired_plan(expired_plan_uuid)
-    remediated = 0
+    # ENT-11672 — Expiration continuity: re-upgrade any audit-mode enrollments for learners
+    # whose license requests were just approved.
+    lms_client = LmsApiClient()
 
-    for learner in affected_learners:
+    upgrades_by_enterprise = {}
+    for license_request in license_requests:
+        if license_request.state != SubsidyRequestStates.APPROVED:
+            continue
+        if not license_request.license_uuid or not license_request.course_id:
+            continue
+        enterprise_uuid = str(license_request.enterprise_customer_uuid)
+        upgrades_by_enterprise.setdefault(enterprise_uuid, []).append({
+            'user_id': license_request.user.lms_user_id,
+            'course_run_key': license_request.course_id,
+            'license_uuid': str(license_request.license_uuid),
+        })
+
+    for enterprise_uuid, enrollments_info in upgrades_by_enterprise.items():
         try:
-            other_licenses = lm_client.get_licenses_for_learner(
-                learner['lms_user_id'], enterprise_customer_uuid,
-                status='activated', exclude_plan_uuid=expired_plan_uuid,
+            lms_client.bulk_enroll_enterprise_learners(
+                enterprise_customer_uuid=enterprise_uuid,
+                enrollments_info=enrollments_info,
             )
-            current_licenses = [l for l in other_licenses if l.get('subscription_plan', {}).get('is_current')]
-            if not current_licenses:
-                continue
-
-            licenses_by_catalog = {}
-            for lic in current_licenses:
-                cat = lic.get('subscription_plan', {}).get('enterprise_catalog_uuid')
-                if cat:
-                    licenses_by_catalog.setdefault(cat, []).append(lic)
-
-            downgraded = enterprise_client.get_audit_enrollments_for_learner(
-                learner['lms_user_id'], enterprise_customer_uuid,
-                downgraded_after=expired_plan_uuid,
+            logger.info(
+                'Re-upgraded %d enrollment(s) to verified for enterprise %s after license assignment.',
+                len(enrollments_info),
+                enterprise_uuid,
             )
-            for enrollment in downgraded:
-                matching = []
-                for cat in enrollment.get('applicable_enterprise_catalog_uuids', []):
-                    matching.extend(licenses_by_catalog.get(cat, []))
-                if not matching:
-                    continue
-                best = max(matching, key=lambda l: (
-                    l.get('subscription_plan', {}).get('expiration_date', ''),
-                    l.get('activation_date', ''), l.get('uuid', ''),
-                ))
-                enterprise_client.upgrade_enrollment_to_verified(
-                    lms_user_id=learner['lms_user_id'],
-                    course_run_key=enrollment['course_run_key'],
-                    license_uuid=best['uuid'],
-                )
-                remediated += 1
-        except Exception as exc:
-            self.retry(exc=exc, countdown=60 * 2 ** self.request.retries)
-
-    return {'remediated': remediated, 'expired_plan_uuid': expired_plan_uuid}
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.exception(
+                'Failed to re-upgrade enrollments for enterprise %s after license assignment: %s',
+                enterprise_uuid,
+                exc,
+            )
 ```
 
-**Proposed signal handler module (new file):**
+**Why this approach over a new standalone task:**
 
-```python
-# enterprise_access/apps/bffs/signals.py
-from openedx_events.enterprise.signals import SUBSCRIPTION_PLAN_EXPIRED
-from django.dispatch import receiver
-
-@receiver(SUBSCRIPTION_PLAN_EXPIRED)
-def handle_subscription_plan_expired(sender, signal, **kwargs):
-    plan_data = kwargs.get('subscription_plan')
-    if plan_data:
-        remediate_enrollment_downgrades_for_expired_plan.delay(
-            expired_plan_uuid=str(plan_data.uuid),
-            enterprise_customer_uuid=str(plan_data.enterprise_customer_uuid),
-        )
-
-```
-
-**Note:** This repository already uses Django/openedx signal-handler patterns (for example in app-level `signals.py` modules). If true event-bus consumption is needed, it would typically be implemented via a management command pattern similar to `enterprise_access/apps/core/management/commands/consume_enterprise_ping_events.py`, not as a `bffs/event_handlers.py` module.
+| Consideration | New standalone task | Update existing task (chosen) |
+|---|---|---|
+| New files required | `bffs/tasks.py`, `bffs/signals.py` | None |
+| Signal/event dependency | Requires `SUBSCRIPTION_PLAN_EXPIRED` (not in `openedx_events`) | None — fires on admin approval |
+| License UUID available | Needs separate LM API call | Already on `license_request.license_uuid` |
+| Course ID available | Needs separate LMS API call | Already on `license_request.course_id` |
+| Retry handling | New retry config needed | Inherited from `LoggedTaskWithRetry` |
+| Blast radius | New code path | Minimal — `except` block prevents failures from disrupting existing flow |
 
 ### Enrollment-Time vs Post-Expiration: Decision Matrix
 
@@ -1644,7 +1628,7 @@ To make the expiration-remediation design production-safe, the implementation sh
 | Phase | Scope | Action |
 |---|---|---|
 | 1 | BFF | `transform_licenses`, per-course mapping, `license_schema_version` |
-| 2 | BFF | Expiration remediation Celery task + signal handler |
+| 2 | API tasks | Expiration continuity re-upgrade added to `update_license_requests_after_assignments_task` — ✅ Done |
 | 3 | MFE data | `transformSubscriptionsData`, TypeScript types, cache patch |
 | 4 | MFE search | `useSearchCatalogs` — all catalog UUIDs |
 | 5 | MFE course | `getApplicableLicensesForCourse`, `selectBestLicense`, `shouldUpgradeUserEnrollment` |
@@ -1658,7 +1642,7 @@ To make the expiration-remediation design production-safe, the implementation sh
 
 ## Open Questions (v2 Addenda)
 
-5. **Remediation ownership**: Should re-upgrade logic live in `enterprise-access` or be a feature request to `license-manager` team to check for sibling licenses before downgrading?
-6. **Remediation timing**: Synchronous within expiration task, or async Celery after expiration signal/event? Async preferred for blast-radius containment.
+5. ~~**Remediation ownership**~~: **Resolved** — re-upgrade logic lives in `enterprise-access`, inside the existing `update_license_requests_after_assignments_task`. No dependency on `license-manager` changes.
+6. ~~**Remediation timing**~~: **Resolved** — runs synchronously within the existing task immediately after a license request is approved, removing the need for a separate async signal/event flow.
 7. **Enrollment audit trail**: Should a record link the new license to the re-upgraded enrollment separately from the original expired license association?
 8. **Sidebar Summary Card UX**: With multi-license in different states, should the card show the most critical status (soonest expiry) or the best status (longest-lived)?
