@@ -1,110 +1,95 @@
+
 # feat: Multi-License Subscription Support for Enterprise BFF
 
 ## Tickets
 
-- **ENT-11683** – Backend: Multi-license subscription support (preserve all active licenses per learner)
-- **ENT-11685** – API response structure + comprehensive test coverage for multi-license scenarios
-- **ENT-11672** – Business rule: first-activated license wins when a course appears in multiple catalogs
+- ENT-11683: Backend multi-license support
+- ENT-11685: API response structure & test coverage
+- ENT-11672: First-activated license selection rule
 
 ---
 
-## Problem We Resolved
+## Problems We Resolved (Summary)
 
-### Before This Change
-
-The BFF (Backend for Frontend) returned only **one** `subscription_license` per learner. The selection
-strategy was "latest expiration date wins", which caused two problems:
-
-1. **Wrong license selected**: For a learner like Alice who holds three licenses (Leadership, Compliance,
-   Data Science) across separate catalog UUIDs, the backend incorrectly selected the _Compliance_ license
-   (357 days remaining) instead of the _Leadership_ license that was activated first.
-
-2. **No catalog-to-license mapping**: Consumers had no way to determine which license applied to a given
-   catalog/course, forcing them to guess or implement their own resolution logic.
-
-3. **Incorrect Algolia key scoping**: The secured Algolia key was scoped to a single catalog query UUID,
-   so learners with licenses in multiple catalogs could only search content from one catalog.
-
-### After This Change
-
-- All active licenses are preserved in the `subscription_licenses` array.
-- A new `licenses_by_catalog` dictionary maps each catalog UUID to its corresponding license — enabling
-  O(1) per-catalog lookups for frontend consumers.
-- `license_schema_version: "v2"` signals the new response format to API consumers.
-- `subscription_license` (singular, backward-compat) now selects by **first activation date ASC** — the
-  learner's earliest-activated license wins (ENT-11672 business rule).
-- Algolia key scoping now covers **all** catalog UUIDs from all active licenses.
-- A WaffleFlag controls the rollout — when OFF, the v1 legacy response is returned unchanged.
+- Only one license was selected per learner (latest expiry), causing incorrect entitlements for multi-catalog users.
+- No way to map licenses to catalogs in API responses.
+- Algolia search was scoped to a single catalog, not all licensed catalogs.
 
 ---
 
-## API Response Changes
+## API Contract Changes
 
-### Feature Flag
+- New field: `licenses_by_catalog` (dict: catalog_uuid → license) in API response
+- New field: `license_schema_version` ("v2" when flag ON, "v1" when OFF)
+- `subscription_license` selection now uses first activation date (not latest expiry)
+- All active licenses are returned in `subscription_licenses`
+- Feature flag: `enterprise_access.enable_multi_license_entitlements_bff` (WaffleFlag)
+- Algolia key scoping now covers all licensed catalogs
 
-```
-enterprise_access.enable_multi_license_entitlements_bff
-```
-
-Namespace: `enterprise_access` | Type: `WaffleFlag`
-
-When **OFF** → `license_schema_version: "v1"`, no `licenses_by_catalog`, single-license behavior.  
-When **ON** → `license_schema_version: "v2"`, `licenses_by_catalog` dict included, first-activated selection.
-
----
-
-### Old Response (flag OFF / v1)
-
-```json
-{
-  "subscription_license": {
-    "uuid": "cccccccc-...",            // Compliance license (latest expiry — WRONG)
-    "status": "activated",
-    "subscription_plan": {
-      "title": "Compliance Catalog Plan",
-      "enterprise_catalog_uuid": "cat-compliance-uuid",
-      "is_current": true
-    }
-  },
-  "subscription_licenses": [
-    { "uuid": "aaaa...", "status": "activated", ... },  // Leadership
-    { "uuid": "bbbb...", "status": "activated", ... },  // Data Science
-    { "uuid": "cccc...", "status": "activated", ... }   // Compliance
-  ]
-  // NO licenses_by_catalog
-  // NO license_schema_version
-}
-```
-
-### New Response (flag ON / v2)
+### Example (flag ON)
 
 ```json
 {
   "license_schema_version": "v2",
-  "subscription_license": {
-    "uuid": "aaaa...",          // Leadership license (first-activated — CORRECT)
-    "status": "activated",
-    "activated_at": "2024-01-15T00:00:00Z",
-    "subscription_plan": {
-      "title": "Leadership Catalog Plan",
-      "enterprise_catalog_uuid": "cat-leadership-uuid",
-      "is_current": true
-    }
-  },
-  "subscription_licenses": [
-    { "uuid": "aaaa...", "status": "activated", ... },  // Leadership
-    { "uuid": "bbbb...", "status": "activated", ... },  // Data Science
-    { "uuid": "cccc...", "status": "activated", ... }   // Compliance
-  ],
-  "licenses_by_catalog": {
-    "cat-leadership-uuid": { "uuid": "aaaa...", "status": "activated", ... },
-    "cat-datascience-uuid": { "uuid": "bbbb...", "status": "activated", ... },
-    "cat-compliance-uuid": { "uuid": "cccc...", "status": "activated", ... }
-  }
+  "subscription_license": { ... },
+  "subscription_licenses": [ ... ],
+  "licenses_by_catalog": { "cat-uuid": { ... } }
+}
+```
+
+### Example (flag OFF)
+
+```json
+{
+  "subscription_license": { ... },
+  "subscription_licenses": [ ... ]
 }
 ```
 
 ---
+
+## Code Changes
+
+**Major files updated:**
+
+- `handlers.py`: Multi-license logic, catalog mapping, selection rule
+- `serializers.py`: New fields in API response
+- `context.py`: Passes flag state
+- `api.py`: Updated endpoints and cache logic for multi-license
+- `toggles.py`: Feature flag definition
+
+**Tests:**
+- `test_multi_license.py`: Multi-license scenarios
+- `test_toggles.py`: Feature flag tests
+- `test_handlers.py`: Algolia scoping
+- `test_enterprise_catalog_client.py`: Multi-catalog client
+
+---
+
+## Test Coverage
+
+- All new logic and edge cases are covered:
+  - Single and multiple licenses
+  - Catalog mapping
+  - Feature flag ON/OFF
+  - Tie-breakers, no-license, and regression scenarios
+- All tests pass (see CI for coverage %)
+
+---
+
+## Rollout
+
+1. Deploy with flag OFF (no change for users)
+2. Enable flag for QA, then production
+3. Monitor for regressions
+
+---
+
+## Notes
+
+- `subscription_license` is backward compatible
+- `licenses_by_catalog` only includes activated licenses
+- Algolia scoping matches all licensed catalogs when flag is ON
 
 ## Code Changes
 
