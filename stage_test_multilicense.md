@@ -9,13 +9,30 @@
 
 ## Active Licenses & Catalogs
 
-| # | Plan Title | Plan UUID | Catalog UUID | Type | Auto-Apply |
-|---|---|---|---|---|---|
-| 1 | Multilicense subscription test plan | `8e5c18a0-d9e1-4cb5-a6fc-1a664e45bf0b` | `d9d84c82-2b7f-4bab-94bd-8514ced3e5ad` | Test | ✅ Yes |
-| 2 | Multilicense sibscription plan | `75c92c53-5fdc-4c38-9100-17aabd2e3b00` | `7a495a16-55c3-43f7-b846-2440f52837df` | Test | No |
-| 3 | Alberto Company Test 10 TRIAL (Teams) | `dec37e15-b3b2-45d9-a97f-073ed335772b` | `b772212c-cbb6-43dc-bbc2-aa19f4b48277` | Trial | No |
+| # | Plan Title | Plan UUID | Catalog UUID | Type | Auto-Apply | Courses |
+|---|---|---|---|---|---|---|
+| 1 | Multilicense subscription test plan | `8e5c18a0-d9e1-4cb5-a6fc-1a664e45bf0b` | `d9d84c82-2b7f-4bab-94bd-8514ced3e5ad` | Test | ✅ Yes | |
+| 2 | Multilicense sibscription plan | `75c92c53-5fdc-4c38-9100-17aabd2e3b00` | `7a495a16-55c3-43f7-b846-2440f52837df` | Test | No | |
+| 3 | Alberto Company Test 10 TRIAL (Teams) | `dec37e15-b3b2-45d9-a97f-073ed335772b` | `b772212c-cbb6-43dc-bbc2-aa19f4b48277` | Trial | No | 253 |
 
-**All 3 licenses expire:** `2026-06-30`
+**All 3 licenses expire:** `2026-06-30`  
+**Total courses across all catalogs:** 253 (confirmed in catalog `b772212c`)  
+**Starting state:** `enterprise_course_enrollments: []` — no enrollments yet ✅ clean slate for testing
+
+> ⚠️ **Note:** The enterprise has a 4th catalog `2513af28-30d9-4570-9e27-62ae4cdc3013` in `enterprise_customer_catalogs` but it does **NOT** appear in `available_subscription_catalogs` — meaning no active subscription plan is linked to it. This catalog can be used as a **"no subscription coverage"** catalog for negative testing (Scenario 3).
+
+---
+
+## Catalog → Catalog Query UUID Mapping
+
+| Catalog UUID | Catalog Query UUID |
+|---|---|
+| `b772212c-cbb6-43dc-bbc2-aa19f4b48277` | `272216a0-4e4b-407b-8a22-3717353830d1` |
+| `7a495a16-55c3-43f7-b846-2440f52837df` | `ca64a7b3-8d4b-413c-8e5e-5cb3f4f883ff` |
+| `d9d84c82-2b7f-4bab-94bd-8514ced3e5ad` | `6d442878-8f03-419b-a8ad-c5225681ccb8` |
+| `2513af28-30d9-4570-9e27-62ae4cdc3013` | `30ae91be-ae27-4948-8c7b-e4aeb691c790` |
+
+> These query UUIDs are used by Algolia for search filtering. The secured Algolia key in the response restricts search to these 5 catalog query UUIDs.
 
 ---
 
@@ -68,19 +85,23 @@ GET https://enterprise-catalog-internal.stage.edx.org/api/v1/enterprise-catalogs
 
 ---
 
-### Scenario 3: Course NOT in Any Catalog
+### Scenario 3: Course NOT in Any Subscribed Catalog
 
-Verify a course outside all 3 catalogs shows a payment/upgrade prompt.
+Verify a course outside all 3 subscribed catalogs shows a payment/upgrade prompt.
+
+> **Tip:** Use catalog `2513af28-30d9-4570-9e27-62ae4cdc3013` — it exists for this enterprise but has **no subscription plan linked**, so courses exclusive to it should not be accessible for free.
 
 **Steps:**
-1. Find a course key that does NOT appear in catalogs `b772212c`, `7a495a16`, or `d9d84c82`
-2. Navigate directly to the course page
-3. **Expected:** Payment prompt or "Not available" message — no free enroll button
-
-**Check if course is in a catalog:**
-```
-GET https://enterprise-catalog-internal.stage.edx.org/api/v1/enterprise-catalogs/b772212c-cbb6-43dc-bbc2-aa19f4b48277/contains_content_items/?course_run_ids=course-v1:<ORG>+<COURSE>+<RUN>
-```
+1. Get a course from the unsubscribed catalog `2513af28`:
+   ```
+   GET https://enterprise-catalog-internal.stage.edx.org/api/v1/enterprise-catalogs/2513af28-30d9-4570-9e27-62ae4cdc3013/get_content_metadata?content_type=course&limit=5
+   ```
+2. Confirm the course key is NOT in catalogs `b772212c`, `7a495a16`, or `d9d84c82`:
+   ```
+   GET https://enterprise-catalog-internal.stage.edx.org/api/v1/enterprise-catalogs/b772212c-cbb6-43dc-bbc2-aa19f4b48277/contains_content_items/?course_run_ids=course-v1:<ORG>+<COURSE>+<RUN>
+   ```
+3. Navigate to that course page in learner portal
+4. **Expected:** Payment prompt or "Not available" — no free enroll button
 
 ---
 
@@ -130,7 +151,7 @@ Call the enterprise learner BFF endpoint and check `enterprise_customer_user_sub
 | 4 | Enroll in course from catalog `b772212c` | No payment prompt | |
 | 5 | Enroll in course from catalog `7a495a16` | No payment prompt | |
 | 6 | Enroll in course from catalog `d9d84c82` | No payment prompt | |
-| 7 | Enroll in course NOT in any catalog | Payment/upgrade prompt shown | |
+| 7 | Enroll in course from unsubscribed catalog `2513af28` | Payment/upgrade prompt shown | |
 | 8 | New user joins enterprise | Auto-assigned license from Plan 1 | |
 | 9 | Search shows courses from all 3 catalogs combined | Combined catalog results visible | |
 
