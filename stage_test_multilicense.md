@@ -11,13 +11,15 @@
 
 | # | Plan Title | Plan UUID | Catalog UUID | Type | Auto-Apply | Courses |
 |---|---|---|---|---|---|---|
-| 1 | Multilicense subscription test plan | `8e5c18a0-d9e1-4cb5-a6fc-1a664e45bf0b` | `d9d84c82-2b7f-4bab-94bd-8514ced3e5ad` | Test | ✅ Yes | |
-| 2 | Multilicense sibscription plan | `75c92c53-5fdc-4c38-9100-17aabd2e3b00` | `7a495a16-55c3-43f7-b846-2440f52837df` | Test | No | |
-| 3 | Alberto Company Test 10 TRIAL (Teams) | `dec37e15-b3b2-45d9-a97f-073ed335772b` | `b772212c-cbb6-43dc-bbc2-aa19f4b48277` | Trial | No | 253 |
+| 1 | Multilicense subscription test plan | `8e5c18a0-d9e1-4cb5-a6fc-1a664e45bf0b` | `d9d84c82-2b7f-4bab-94bd-8514ced3e5ad` | Test | ✅ Yes | **209** |
+| 2 | Multilicense sibscription plan | `75c92c53-5fdc-4c38-9100-17aabd2e3b00` | `7a495a16-55c3-43f7-b846-2440f52837df` | Test | No | **1** (`MITx+6.00.1x` only) |
+| 3 | Alberto Company Test 10 TRIAL (Teams) | `dec37e15-b3b2-45d9-a97f-073ed335772b` | `b772212c-cbb6-43dc-bbc2-aa19f4b48277` | Trial | No | **275** |
+| — | *(no plan — unsubscribed)* | N/A | `2513af28-30d9-4570-9e27-62ae4cdc3013` | N/A | No | **1** (`MITx+6.00.1x`) |
 
 **All 3 licenses expire:** `2026-06-30`  
-**Total courses across all catalogs:** 253 (confirmed in catalog `b772212c`)  
 **Starting state:** `enterprise_course_enrollments: []` — no enrollments yet ✅ clean slate for testing
+
+> 🔑 **Multiplex discriminator course:** `MITx+6.00.1x` (*Introduction to Computer Science and Programming Using Python*) — present in Plan 2's catalog (`7a495a16`, count=1) and the unsubscribed catalog (`2513af28`). Redeeming it as the learner proves the system resolved to Plan 2's license specifically.
 
 > ⚠️ **Note:** The enterprise has a 4th catalog `2513af28-30d9-4570-9e27-62ae4cdc3013` in `enterprise_customer_catalogs` but it does **NOT** appear in `available_subscription_catalogs` — meaning no active subscription plan is linked to it. This catalog can be used as a **"no subscription coverage"** catalog for negative testing (Scenario 3).
 
@@ -44,6 +46,21 @@ https://learner.stage.edx.org/alberto-company-test-10/
 
 ---
 
+## Single-License vs Multi-License Testing Strategy
+
+### How to Test Single-License (Temporarily)
+
+1. In **License Manager Django Admin**, set Plans 2 & 3 to `is_active=False` (or revoke learner licenses `bbff9c8e` and `022ba686`)
+2. Only Plan 1 (`8e5c18a0`, auto-apply, 209 courses) remains active
+3. Run your single-license scenarios — auto-apply kicks in, learner gets 1 license
+4. Re-enable Plans 2 & 3 to restore multi-license state
+
+**Admin links to toggle:**
+- Plan 2: `https://license-manager-internal.stage.edx.org/admin/subscriptions/subscriptionplan/75c92c53-5fdc-4c38-9100-17aabd2e3b00/change/`
+- Plan 3: `https://license-manager-internal.stage.edx.org/admin/subscriptions/subscriptionplan/dec37e15-b3b2-45d9-a97f-073ed335772b/change/`
+
+---
+
 ## Test Scenarios
 
 ### Scenario 1: Single License Behavior
@@ -61,25 +78,37 @@ Verify the system correctly identifies the "primary" license.
 
 ---
 
-### Scenario 2: Multi-License — All 3 Catalogs Accessible
+### Scenario 2: Multi-License — Discriminator Course Proves Correct License Resolution
 
-Verify courses from all 3 catalogs are accessible (no payment wall).
+Verify courses from all 3 catalogs are accessible, and that the system resolves to the **correct license** per catalog.
+
+**The key test — `MITx+6.00.1x`:**
+- This course is in **Plan 2's catalog only** (`7a495a16`, 1 course total)
+- If `can-redeem` returns `redeemable: true` with `plan_uuid: dec37e15` (Trial) instead of `75c92c53` (Plan 2), that's a bug
+- **Expected:** system selects Plan 2's license (`bbff9c8e`) for this course
 
 **Steps:**
 1. Go to `https://learner.stage.edx.org/alberto-company-test-10/search`
 2. The search results should include courses from **all 3 catalogs combined**
-3. Pick one course from each catalog (see API calls below to find courses)
-4. Click **Enroll** on each → should enroll without a payment prompt
+3. Enroll in `MITx+6.00.1x` — should enroll free using Plan 2's license
+4. Enroll in any course from catalog `b772212c` (275 courses) — should use Plan 3's license
+5. Enroll in any course from catalog `d9d84c82` (209 courses) — should use Plan 1's license
+
+**Verify `can-redeem` picks the right license:**
+```bash
+curl -H "Authorization: JWT <token>" \
+  "https://enterprise-access.stage.edx.org/api/v1/policy-redemption/credits_available/?enterprise_customer_uuid=19aaee56-e2f8-46e6-aa35-7f1db205a6ff&lms_user_id=5278674&content_key=MITx+6.00.1x"
+```
 
 **Get courses per catalog:**
 ```
-# Catalog 1 — Plan 3 (Trial)
+# Catalog 1 — Plan 3 Trial (275 courses)
 GET https://enterprise-catalog-internal.stage.edx.org/api/v1/enterprise-catalogs/b772212c-cbb6-43dc-bbc2-aa19f4b48277/get_content_metadata?content_type=course&limit=5
 
-# Catalog 2 — Plan 2
+# Catalog 2 — Plan 2 (1 course: MITx+6.00.1x) ← discriminator
 GET https://enterprise-catalog-internal.stage.edx.org/api/v1/enterprise-catalogs/7a495a16-55c3-43f7-b846-2440f52837df/get_content_metadata?content_type=course&limit=5
 
-# Catalog 3 — Plan 1 (Auto-apply)
+# Catalog 3 — Plan 1 Auto-apply (209 courses)
 GET https://enterprise-catalog-internal.stage.edx.org/api/v1/enterprise-catalogs/d9d84c82-2b7f-4bab-94bd-8514ced3e5ad/get_content_metadata?content_type=course&limit=5
 ```
 
