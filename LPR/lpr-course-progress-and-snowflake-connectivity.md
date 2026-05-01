@@ -46,7 +46,7 @@ A discovery effort was carried out (tracked in **[ENT-9207](https://2u-internal.
 
 Two approaches were explored:
 
-| Approach | What We Tried | Why It Failed |
+| Approach | Steps Tried | Why  Failed |
 |---|---|---|
 | **Calculate it ourselves** | Derive the progress % from raw Completion API data already in our pipeline | Could not reliably match the numbers learners see in the LMS. Even minor discrepancies would cause ongoing support burden. |
 | **Call the LMS API directly** | Fetch the same endpoint that renders the progress visualization in the LMS | Architecturally not feasible — our data pipeline runs as a batch process and cannot call user-context LMS endpoints at scale. |
