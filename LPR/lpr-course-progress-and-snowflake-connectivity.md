@@ -263,7 +263,7 @@ The current implementation queries Snowflake on every LPR API request to ensure 
 | Admin Portal CSV export | Once per `ENROLLMENTS_PAGE_SIZE` rows streamed |
 | API integrations / automated tooling | Depends on the polling interval of the client |
 
-**Planned improvement — `ENT0-9531`:** We have already identified and scoped a caching layer to sit in front of the Snowflake call. Since `COURSE_PROGRESS` data refreshes only ~daily, a short-lived cache keyed per enterprise will eliminate redundant queries within the same refresh window — significantly reducing the query volume Dave Wolf observed, while keeping the data as fresh as the underlying pipeline allows. 
+**Planned improvement — `ENT0-9531`:** We have already identified and scoped a caching layer to sit in front of the Snowflake call. Since `COURSE_PROGRESS` data refreshes only ~daily, a short-lived cache keyed per enterprise will eliminate redundant queries within the same refresh window — significantly reducing the query volume  observed, while keeping the data as fresh as the underlying pipeline allows. 
 
 ---
 
