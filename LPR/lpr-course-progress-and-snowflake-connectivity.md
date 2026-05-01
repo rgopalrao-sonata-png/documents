@@ -1,6 +1,8 @@
 # Learner Progress Report — `course_progress` Field: Full Technical History & Current State
 
 > **Audience:** Engineering, Product, Data Platform, Snowflake Admins  
+> **Owner team:** Lakshy (Tech Lead: Ramya Gopal Rao; BA/SM: Naveen Naga Kumar Geddada)  
+> **Stakeholders:** Brian Beggs, Dave Wolf (Snowflake admin)  
 > **Related tickets:** [ENT-9207](https://2u-internal.atlassian.net/browse/ENT-9207) (discovery), [ENT-11183](https://2u-internal.atlassian.net/browse/ENT-11183) (implementation), [DPSD-8550](https://2u-internal.atlassian.net/browse/DPSD-8550) (Data Platform — Snowflake table), ENT0-9531 (caching)  
 > **Data Platform PR:** [warehouse-transforms#7163](https://github.com/edx/warehouse-transforms/pull/7163/changes)  
 > **Status as of May 2026:** `course_progress` is live in production, reading from `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL`. Snowflake auth migration to key pair is pending (deadline: end of August 2026).  
@@ -278,12 +280,13 @@ If the Snowflake call fails for any reason — wrong credentials, network timeou
 - A `WARNING` is logged with full traceback for observability.
 
 This design means:
-- Any future auth or connectivity change can be tested safely without risking the LPR API.
-- Any Snowflake outage has a bounded, predictable impact.
+- Any future auth or connectivity change (including the key pair migration) can be deployed and validated in staging without risking the production LPR API.
+- Any Snowflake outage has a bounded, predictable impact — `course_progress` degrades to `null` for the duration, nothing else breaks.
+- The caching improvement (`ENT0-9531`) can be introduced safely because the fallback path already exists.
 
 ---
 
-## 8. Summary for Dave Wolf
+## 8. Summary for Snowflake Admin (Dave Wolf)
 
 ### 8.1 Answers to Dave's questions
 
@@ -291,6 +294,8 @@ This design means:
 |---|---|
 | **Is this flow still needed?** | Yes. It powers the `course_progress` field in the LPR — a top customer request. Disabling it would regress the feature to `null` for all enterprises. |
 | **Is this a reverse ETL?** | No. The application is strictly read-only. It SELECTs one column (`COURSE_PROGRESS`) and never writes back. |
-| **Who requests these reports?** | Enterprise admin users using the Admin Portal. Each page load or CSV export triggers a Snowflake query. |
+| **Who requests these reports?** | Enterprise admin users (employees of enterprise customers) using the Admin Portal. Each page load or CSV export triggers a Snowflake query. |
 | **Why so frequently?** | Queries fire per API request with no caching layer today. Every page load and every CSV page triggers a new connection + SELECT. |
-| **Who would do the key pair migration?** | The Lakshy team (this repo). The code change is straightforward — swap `password` for `private_key` in the connector call. We need respective team to generate the RSA key pair and register the public key against `ENTERPRISE_SERVICE_USER` . |
+| **Who would do the key pair migration?** | The Lakshy team (this repo). The code change is straightforward — swap `password` for `private_key` in the connector call. We need Dave's team to generate the RSA key pair and register the public key against `ENTERPRISE_SERVICE_USER` first. |
+
+
