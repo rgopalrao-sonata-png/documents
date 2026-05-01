@@ -1,9 +1,12 @@
 # Learner Progress Report — `course_progress` Field: Full Technical History & Current State
 
 > **Audience:** Engineering, Product, Data Platform, Snowflake Admins  
-> **Related tickets:** ENT-9207 (discovery), ENT-11183 (implementation), DPSD-8550 (Data Platform — Snowflake table), ENT0-9531 (caching)  
+> **Owner team:** Lakshy (Tech Lead: Ramya Gopal Rao; BA/SM: Naveen Naga Kumar Geddada)  
+> **Stakeholders:** Brian Beggs, Dave Wolf (Snowflake admin)  
+> **Related tickets:** [ENT-9207](https://2u-internal.atlassian.net/browse/ENT-9207) (discovery), [ENT-11183](https://2u-internal.atlassian.net/browse/ENT-11183) (implementation), [DPSD-8550](https://2u-internal.atlassian.net/browse/DPSD-8550) (Data Platform — Snowflake table), ENT0-9531 (caching)  
 > **Data Platform PR:** [warehouse-transforms#7163](https://github.com/edx/warehouse-transforms/pull/7163/changes)  
-> **Status as of May 2026:** `course_progress` is live in production, reading from `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL`. Snowflake auth migration to key pair is **in progress** (deadline: end of August 2026).
+> **Status as of May 2026:** `course_progress` is live in production, reading from `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL`. Snowflake auth migration to key pair is pending (deadline: end of August 2026).  
+> **Origin:** Slack thread initiated by Dave Wolf (Snowflake team) regarding `ENTERPRISE_SERVICE_USER` still authenticating via username/password.
 
 ---
 
@@ -36,12 +39,19 @@ The existing `current_grade` field does not satisfy this need because:
 
 ## 2. Previous Discovery Attempts & Why They Failed
 
-A discovery effort was carried out (tracked in **ENT-9207**). Two approaches were explored:
+A discovery effort was carried out (tracked in **[ENT-9207](https://2u-internal.atlassian.net/browse/ENT-9207)**). The original acceptance criteria asked:
+
+1. Can we replicate the Completion API representation of course progress that learners see in the LMS?
+2. Can we call the API directly that generates the progress visualization, so we stay in sync with the numbers learners see?
+3. If not, can we calculate it from Completion API data and match the results? (Harder — even minor errors would cause headaches.)
+4. If none of the above, can we document what architectural work would be required to become consumers of that API?
+
+Two approaches were explored:
 
 | Approach | What We Tried | Why It Failed |
 |---|---|---|
-| **Calculate it ourselves** | Derive the progress % from raw completion API data we already have in our pipeline | Could not reliably match the numbers learners see in the LMS. Even minor discrepancies would cause ongoing support burden. |
-| **Call the LMS API directly** | Fetch the same endpoint that renders the progress visualization in the LMS | Architecturally not feasible at the time — our data pipeline runs as a batch process and cannot call user-context LMS endpoints at scale. |
+| **Calculate it ourselves** | Derive the progress % from raw Completion API data already in our pipeline | Could not reliably match the numbers learners see in the LMS. Even minor discrepancies would cause ongoing support burden. |
+| **Call the LMS API directly** | Fetch the same endpoint that renders the progress visualization in the LMS | Architecturally not feasible — our data pipeline runs as a batch process and cannot call user-context LMS endpoints at scale. |
 
 **Outcome of ENT-9207:** The effort was suspended. The problems were documented and a shared understanding was reached that the feature would need Data Platform involvement to surface the already-calculated value from within the warehouse.
 
@@ -50,12 +60,14 @@ A discovery effort was carried out (tracked in **ENT-9207**). Two approaches wer
 > *Ammar: LPR data lags real time by one day. So if we add the progress into the LPR pipeline, it can create confusion — the data in the LPR is a day old, but the learner sees the latest progress in the LMS.*
 >
 > *NR: We can defend a data lag as long as the data provenance is good. It would be preferable if we can inherit the progress calculated in the LMS chart rather than recalculating it ourselves.*
+>
+> *Clarification from NR: We do NOT want to show the course completion percentage visualization in the LPR table. We want the % value as a field. Any references to the "visual API" should be read as: "is there a way to fetch this value from the same API that renders the progress image in the LMS, so we skip trying to calculate it ourselves?"*
 
 ---
 
 ## 3. How We Solved It — Current Implementation (ENT-11183)
 
-The breakthrough came when the Data Platform team (ticket **DPSD-8550**) confirmed they could surface the pre-calculated `COURSE_PROGRESS` value — the same value the LMS exposes to learners — directly in a Snowflake table: `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL`.
+The breakthrough came when the Data Platform team (ticket **[DPSD-8550](https://2u-internal.atlassian.net/browse/DPSD-8550)**) confirmed they could surface the pre-calculated `COURSE_PROGRESS` value — the same value the LMS exposes to learners — directly in a Snowflake table: `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL`. The Data Platform's work was delivered via [warehouse-transforms#7163](https://github.com/edx/warehouse-transforms/pull/7163/changes).
 
 This bypassed both failed approaches from ENT-9207:
 - We no longer need to recalculate the value ourselves.
@@ -241,13 +253,23 @@ An **independent** Snowflake client used by scheduled batch reporting jobs in `e
 
 ## 6. Query Frequency Explained
 
-There is no caching layer in front of the Snowflake call today (ticket `ENT0-9531` tracks adding one). The query fires on every LPR API request:
+### 6.1 Who triggers the queries?
+
+The Snowflake queries Dave Wolf observed in the query history are triggered by **enterprise admin users** (employees of enterprise customers like GoLearning) using the **Admin Portal** web application. When an admin navigates to the Learner Progress Report page, the frontend calls our API, and our API calls Snowflake.
+
+These are **not** automated batch jobs or cron-triggered exports. They are real-time, user-initiated API requests.
+
+### 6.2 Why so frequent?
+
+There is no caching layer in front of the Snowflake call today (ticket `ENT0-9531` tracks adding one). A new Snowflake query fires on every LPR API request:
 
 | Trigger | When it fires |
 |---|---|
 | Admin Portal loads the LPR table | Once per page load, once per pagination event |
 | Admin Portal CSV export | Once per `ENROLLMENTS_PAGE_SIZE` rows streamed |
 | API integrations / automated tooling | Depends on the polling interval of the client |
+
+Connections are opened and closed per call — there is no persistent connection pool. This contributes to the volume of login events visible in Snowflake's query history.
 
 Each query is scoped tightly: one enterprise UUID, and only the `(user_email, courserun_key)` pairs on that specific page. No full-table scans.
 
@@ -269,6 +291,18 @@ This design means:
 
 ## 8. Summary for Snowflake Admin (Dave Wolf)
 
+### 8.1 Answers to Dave's questions
+
+| Question | Answer |
+|---|---|
+| **Is this flow still needed?** | Yes. It powers the `course_progress` field in the LPR — a top customer request. Disabling it would regress the feature to `null` for all enterprises. |
+| **Is this a reverse ETL?** | No. The application is strictly read-only. It SELECTs one column (`COURSE_PROGRESS`) and never writes back. |
+| **Who requests these reports?** | Enterprise admin users (employees of enterprise customers) using the Admin Portal. Each page load or CSV export triggers a Snowflake query. |
+| **Why so frequently?** | Queries fire per API request with no caching layer today. Every page load and every CSV page triggers a new connection + SELECT. |
+| **Who would do the key pair migration?** | The Lakshy team (this repo). The code change is straightforward — swap `password` for `private_key` in the connector call. We need Dave's team to generate the RSA key pair and register the public key against `ENTERPRISE_SERVICE_USER` first. |
+
+### 8.2 Suggested response to Dave
+
 > The `ENTERPRISE_SERVICE_USER` queries you see in Snowflake's query history are **read-only SELECT statements** against `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL`. They are triggered in real time whenever an enterprise admin loads or exports their Learner Progress Report in the Admin Portal. The application **never writes to Snowflake** — data flows strictly one-way, from Snowflake into our API responses.
 >
-> You are correct that the current auth method (username + password) needs to be upgraded to key pair auth. We have filed the engineering tickets to make this change (Tickets 2 and 3 above). On our end, the code change is straightforward — we swap `password` for `private_key` in the connector call. We need your team to generate the RSA key pair and register the public key against `ENTERPRISE_SERVICE_USER` (and the reporting service user) as a prerequisite. We are well within the August deadline and will share ticket links once created.
+> You are correct that the current auth method (username + password) needs to be upgraded to key pair auth. On our end, the code change is straightforward — we swap `password` for `private_key` in the connector call. We need your team to generate the RSA key pair and register the public key against `ENTERPRISE_SERVICE_USER` (and the reporting service user) as a prerequisite. We are well within the August deadline and will share the Jira ticket links once created.
