@@ -286,7 +286,7 @@ This design means:
 
 ---
 
-## 8. Summary for Snowflake Admin (Dave Wolf)
+## 8. Summary for Dave Wolf
 
 ### 8.1 Answers to Dave's questions
 
