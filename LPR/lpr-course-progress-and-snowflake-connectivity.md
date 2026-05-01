@@ -283,7 +283,7 @@ This design means:
 
 ---
 
-## 8. Summary for Snowflake Admin (Dave Wolf)
+## 8. Summary for Dave Wolf
 
 ### 8.1 Answers to Dave's questions
 
@@ -291,6 +291,6 @@ This design means:
 |---|---|
 | **Is this flow still needed?** | Yes. It powers the `course_progress` field in the LPR — a top customer request. Disabling it would regress the feature to `null` for all enterprises. |
 | **Is this a reverse ETL?** | No. The application is strictly read-only. It SELECTs one column (`COURSE_PROGRESS`) and never writes back. |
-| **Who requests these reports?** | Enterprise admin users (employees of enterprise customers) using the Admin Portal. Each page load or CSV export triggers a Snowflake query. |
+| **Who requests these reports?** | Enterprise admin users using the Admin Portal. Each page load or CSV export triggers a Snowflake query. |
 | **Why so frequently?** | Queries fire per API request with no caching layer today. Every page load and every CSV page triggers a new connection + SELECT. |
-| **Who would do the key pair migration?** | The Lakshy team (this repo). The code change is straightforward — swap `password` for `private_key` in the connector call. We need respective team to generate the RSA key pair and register the public key against `ENTERPRISE_SERVICE_USER` first. |
+| **Who would do the key pair migration?** | The Lakshy team (this repo). The code change is straightforward — swap `password` for `private_key` in the connector call. We need respective team to generate the RSA key pair and register the public key against `ENTERPRISE_SERVICE_USER` . |
