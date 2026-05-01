@@ -84,89 +84,85 @@ This bypassed both failed approaches from ENT-9207:
 
 ## 4. Architecture & Data Flow
 
-### 4.1 High-Level System Context
+### 4.1 High-Level System Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        UPSTREAM SYSTEMS                             │
-│                                                                     │
-│  ┌──────────────────┐          ┌──────────────────────────────────┐ │
-│  │   LMS / edX      │          │   Data Platform Pipeline         │ │
-│  │  Completion API  │──batch──►│   (DPSD-8550, ~daily refresh)    │ │
-│  │                  │          │   Calculates COURSE_PROGRESS     │ │
-│  └──────────────────┘          └───────────────┬──────────────────┘ │
-└───────────────────────────────────────────────┼─────────────────────┘
-                                                 │ writes
-                                                 ▼
-                              ┌──────────────────────────────────────┐
-                              │             SNOWFLAKE                │
-                              │  PROD.ENTERPRISE                     │
-                              │  .LEARNER_PROGRESS_REPORT_INTERNAL   │
-                              │                                      │
-                              │  Columns used:                       │
-                              │    ENTERPRISE_CUSTOMER_UUID          │
-                              │    USER_EMAIL                        │
-                              │    COURSERUN_KEY                     │
-                              │    COURSE_PROGRESS  ◄── only this    │
-                              │                      field is read   │
-                              └──────────────────┬───────────────────┘
-                                                 │ SELECT (read-only,
-                                                 │ per API request)
-                                                 ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    edx-enterprise-data  (this repo)                 │
-│                                                                     │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │         EnterpriseLearnerEnrollmentViewSet                    │  │
-│  │              (enterprise_learner.py)                          │  │
-│  │                                                               │  │
-│  │   ┌────────────────────────┐   ┌───────────────────────────┐ │  │
-│  │   │      Django ORM        │   │  SnowflakeCourseProgress  │ │  │
-│  │   │  EnterpriseLearner     │   │  Source                   │ │  │
-│  │   │  Enrollment table      │   │  (lpr_data_source_        │ │  │
-│  │   │                        │   │   snowflake.py)           │ │  │
-│  │   │  ALL other LPR fields  │   │                           │ │  │
-│  │   │  (grades, dates,       │   │  course_progress ONLY     │ │  │
-│  │   │   enrollment info…)    │   │                           │ │  │
-│  │   └──────────┬─────────────┘   └─────────────┬─────────────┘ │  │
-│  │              │                               │               │  │
-│  │              └──────────── merge ────────────┘               │  │
-│  │                                │                             │  │
-│  │                                ▼                             │  │
-│  │              Serialized enrollment row (all fields)          │  │
-│  └───────────────────────────────────────────────────────────────┘  │
-│                               │                                     │
-└───────────────────────────────┼─────────────────────────────────────┘
-                                │
-               ┌────────────────┴──────────────────┐
-               ▼                                   ▼
-  ┌─────────────────────────┐        ┌──────────────────────────┐
-  │   Admin Portal          │        │   CSV Download           │
-  │   (JSON, paginated)     │        │   (streamed, page-by-    │
-  │                         │        │    page via              │
-  │   /enrollments/?        │        │    StreamingHttpResponse)│
-  │   format=json           │        │   /enrollments/?         │
-  └─────────────────────────┘        │    format=csv            │
-                                     └──────────────────────────┘
+```mermaid
+graph TB
+    subgraph UPSTREAM["UPSTREAM SYSTEMS"]
+        LMS["LMS / edX Platform\n(Completion API)"]
+        DP["Data Platform Pipeline\n(DPSD-8550)\n~daily batch refresh"]
+    end
+
+    subgraph SNOWFLAKE["SNOWFLAKE"]
+        SF_TABLE["PROD.ENTERPRISE\n.LEARNER_PROGRESS_REPORT_INTERNAL\n\nColumns used:\n• ENTERPRISE_CUSTOMER_UUID\n• USER_EMAIL\n• COURSERUN_KEY\n• COURSE_PROGRESS ← only field read"]
+    end
+
+    subgraph APP["edx-enterprise-data (this repo)"]
+        subgraph VIEWSET["EnterpriseLearnerEnrollmentViewSet\n(enterprise_learner.py)"]
+            ORM["Django ORM\nEnterpriseLearnerEnrollment table\n\nALL other LPR fields:\ngrades, dates, enrollment info,\nuser details, offer info…"]
+            SFC["SnowflakeCourseProgressSource\n(lpr_data_source_snowflake.py)\n\ncourse_progress ONLY"]
+            MERGE(("merge"))
+            RESULT["Serialized enrollment row\n(all fields including course_progress)"]
+        end
+    end
+
+    subgraph CONSUMERS["DOWNSTREAM CONSUMERS"]
+        PORTAL["Admin Portal\n(JSON, paginated)\nGET /enrollments/?format=json"]
+        CSV["CSV Download\n(StreamingHttpResponse)\nGET /enrollments/?format=csv"]
+    end
+
+    LMS -- "batch\n(completion events)" --> DP
+    DP -- "writes\nCOURSE_PROGRESS" --> SF_TABLE
+    SF_TABLE -- "SELECT (read-only)\nper API request" --> SFC
+    ORM --> MERGE
+    SFC --> MERGE
+    MERGE --> RESULT
+    RESULT --> PORTAL
+    RESULT --> CSV
+
+    style UPSTREAM fill:#e8f4fd,stroke:#1a73e8,color:#000
+    style SNOWFLAKE fill:#fff3e0,stroke:#e65100,color:#000
+    style APP fill:#e8f5e9,stroke:#2e7d32,color:#000
+    style CONSUMERS fill:#f3e5f5,stroke:#7b1fa2,color:#000
+    style SF_TABLE fill:#fff8e1,stroke:#f57f17,color:#000
+    style ORM fill:#c8e6c9,stroke:#388e3c,color:#000
+    style SFC fill:#c8e6c9,stroke:#388e3c,color:#000
+    style MERGE fill:#a5d6a7,stroke:#2e7d32,color:#000
+    style RESULT fill:#a5d6a7,stroke:#2e7d32,color:#000
+    style PORTAL fill:#e1bee7,stroke:#7b1fa2,color:#000
+    style CSV fill:#e1bee7,stroke:#7b1fa2,color:#000
 ```
 
 ### 4.2 Request-Time Sequence
 
-```
-Admin Portal                  ViewSet                   ORM DB          Snowflake
-     │                           │                         │                │
-     │── GET /enrollments/ ─────►│                         │                │
-     │                           │── filter queryset ─────►│                │
-     │                           │◄─ enrollment rows ───────│                │
-     │                           │                         │                │
-     │                           │── get_course_progress_map(uuid, rows) ──►│
-     │                           │◄─ {(email,courserun): progress} ──────────│
-     │                           │                         │                │
-     │                           │  merge: row['course_progress'] = value    │
-     │                           │                         │                │
-     │◄─ JSON / CSV response ────│                         │                │
-     │   (all fields including   │                         │                │
-     │    course_progress)       │                         │                │
+```mermaid
+sequenceDiagram
+    participant AP as Admin Portal
+    participant VS as EnterpriseLearnerEnrollment<br/>ViewSet
+    participant DB as Application DB<br/>(Django ORM)
+    participant SF as Snowflake<br/>(LEARNER_PROGRESS_REPORT_INTERNAL)
+
+    AP->>VS: GET /enrollments/?enterprise_id=UUID
+    activate VS
+
+    VS->>DB: filter queryset by enterprise UUID<br/>+ apply query param filters
+    activate DB
+    DB-->>VS: enrollment rows<br/>(all fields EXCEPT course_progress)
+    deactivate DB
+
+    VS->>VS: serialize ORM rows<br/>(course_progress = NULL placeholder)
+
+    VS->>SF: get_course_progress_map(uuid, rows)<br/>SELECT USER_EMAIL, COURSERUN_KEY, COURSE_PROGRESS<br/>WHERE enterprise_uuid = ? AND (email, key) IN (...)
+    activate SF
+    SF-->>VS: {(email, courserun_key): progress_value}
+    deactivate SF
+
+    VS->>VS: merge: row['course_progress'] = value<br/>for each matching (email, courserun_key)
+
+    VS-->>AP: JSON response (paginated)<br/>or CSV stream (page-by-page)<br/>ALL fields including course_progress
+    deactivate VS
+
+    Note over VS,SF: If Snowflake fails → course_progress = null<br/>All other fields still returned (graceful degradation)
 ```
 
 **Key design properties:**
