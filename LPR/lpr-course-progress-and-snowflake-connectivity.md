@@ -14,12 +14,9 @@
 3. [How We Solved It — Current Implementation (ENT-11183)](#3-how-we-solved-it--current-implementation-ent-11183)
 4. [Architecture & Data Flow](#4-architecture--data-flow)
 5. [Code Walkthrough](#5-code-walkthrough)
-6. [Collaboration Agreement with Data Platform (DPSD-8550)](#6-collaboration-agreement-with-data-platform-dpsd-8550)
-7. [Snowflake Authentication — Key Pair Migration](#7-snowflake-authentication--key-pair-migration)
-8. [Query Frequency Explained](#8-query-frequency-explained)
-9. [Graceful Degradation](#9-graceful-degradation)
-10. [Tickets to Be Created (Naveen)](#10-tickets-to-be-created-naveen)
-11. [Summary for Snowflake Admin (Dave Wolf)](#11-summary-for-snowflake-admin-dave-wolf)
+6. [Query Frequency Explained](#6-query-frequency-explained)
+7. [Graceful Degradation](#7-graceful-degradation)
+8. [Summary for Snowflake Admin (Dave Wolf)](#8-summary-for-snowflake-admin-dave-wolf)
 
 ---
 
@@ -75,35 +72,96 @@ This bypassed both failed approaches from ENT-9207:
 
 ## 4. Architecture & Data Flow
 
+### 4.1 High-Level System Context
+
 ```
-LMS Completion API
-        │
-        │  (batch, ~daily)
-        ▼
-Data Platform pipeline (DPSD-8550)
-        │
-        │  Pre-calculates COURSE_PROGRESS per learner per course run
-        ▼
-PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL  (Snowflake)
-        │
-        │  SELECT at request time (read-only)
-        ▼
-SnowflakeCourseProgressSource  (lpr_data_source_snowflake.py)
-        │
-        ├── merged with ──►  Django ORM  (EnterpriseLearnerEnrollment table)
-        │                         │  (all other LPR fields)
-        ▼                         ▼
-        EnterpriseLearnerEnrollmentViewSet  (enterprise_learner.py)
-                    │
-                    ▼
-        Admin Portal / API Client
-        (JSON response or CSV download)
+┌─────────────────────────────────────────────────────────────────────┐
+│                        UPSTREAM SYSTEMS                             │
+│                                                                     │
+│  ┌──────────────────┐          ┌──────────────────────────────────┐ │
+│  │   LMS / edX      │          │   Data Platform Pipeline         │ │
+│  │  Completion API  │──batch──►│   (DPSD-8550, ~daily refresh)    │ │
+│  │                  │          │   Calculates COURSE_PROGRESS     │ │
+│  └──────────────────┘          └───────────────┬──────────────────┘ │
+└───────────────────────────────────────────────┼─────────────────────┘
+                                                 │ writes
+                                                 ▼
+                              ┌──────────────────────────────────────┐
+                              │             SNOWFLAKE                │
+                              │  PROD.ENTERPRISE                     │
+                              │  .LEARNER_PROGRESS_REPORT_INTERNAL   │
+                              │                                      │
+                              │  Columns used:                       │
+                              │    ENTERPRISE_CUSTOMER_UUID          │
+                              │    USER_EMAIL                        │
+                              │    COURSERUN_KEY                     │
+                              │    COURSE_PROGRESS  ◄── only this    │
+                              │                      field is read   │
+                              └──────────────────┬───────────────────┘
+                                                 │ SELECT (read-only,
+                                                 │ per API request)
+                                                 ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    edx-enterprise-data  (this repo)                 │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │         EnterpriseLearnerEnrollmentViewSet                    │  │
+│  │              (enterprise_learner.py)                          │  │
+│  │                                                               │  │
+│  │   ┌────────────────────────┐   ┌───────────────────────────┐ │  │
+│  │   │      Django ORM        │   │  SnowflakeCourseProgress  │ │  │
+│  │   │  EnterpriseLearner     │   │  Source                   │ │  │
+│  │   │  Enrollment table      │   │  (lpr_data_source_        │ │  │
+│  │   │                        │   │   snowflake.py)           │ │  │
+│  │   │  ALL other LPR fields  │   │                           │ │  │
+│  │   │  (grades, dates,       │   │  course_progress ONLY     │ │  │
+│  │   │   enrollment info…)    │   │                           │ │  │
+│  │   └──────────┬─────────────┘   └─────────────┬─────────────┘ │  │
+│  │              │                               │               │  │
+│  │              └──────────── merge ────────────┘               │  │
+│  │                                │                             │  │
+│  │                                ▼                             │  │
+│  │              Serialized enrollment row (all fields)          │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                               │                                     │
+└───────────────────────────────┼─────────────────────────────────────┘
+                                │
+               ┌────────────────┴──────────────────┐
+               ▼                                   ▼
+  ┌─────────────────────────┐        ┌──────────────────────────┐
+  │   Admin Portal          │        │   CSV Download           │
+  │   (JSON, paginated)     │        │   (streamed, page-by-    │
+  │                         │        │    page via              │
+  │   /enrollments/?        │        │    StreamingHttpResponse)│
+  │   format=json           │        │   /enrollments/?         │
+  └─────────────────────────┘        │    format=csv            │
+                                     └──────────────────────────┘
 ```
 
-**Important characteristics:**
-- **Data lag:** `COURSE_PROGRESS` in Snowflake reflects a ~daily refresh cadence run by the Data Platform pipeline. This is consistent with the rest of the LPR and is acceptable to customers.
-- **No reverse ETL:** The application never writes to Snowflake. Data flows strictly one-way: Snowflake → application → API response.
+### 4.2 Request-Time Sequence
+
+```
+Admin Portal                  ViewSet                   ORM DB          Snowflake
+     │                           │                         │                │
+     │── GET /enrollments/ ─────►│                         │                │
+     │                           │── filter queryset ─────►│                │
+     │                           │◄─ enrollment rows ───────│                │
+     │                           │                         │                │
+     │                           │── get_course_progress_map(uuid, rows) ──►│
+     │                           │◄─ {(email,courserun): progress} ──────────│
+     │                           │                         │                │
+     │                           │  merge: row['course_progress'] = value    │
+     │                           │                         │                │
+     │◄─ JSON / CSV response ────│                         │                │
+     │   (all fields including   │                         │                │
+     │    course_progress)       │                         │                │
+```
+
+**Key design properties:**
+- **Data lag:** `COURSE_PROGRESS` reflects a ~daily refresh by the Data Platform pipeline — consistent with the rest of the LPR.
+- **Read-only:** The application never writes to Snowflake. Data flows strictly one-way: Snowflake → application → API response.
 - **Single field from Snowflake:** Only `course_progress` comes from Snowflake. Every other LPR field comes from the application database.
+- **Tight query scope:** Each Snowflake call is scoped to one enterprise UUID and only the `(user_email, courserun_key)` pairs on the current page — no full-table scans.
 
 ---
 
@@ -181,99 +239,7 @@ An **independent** Snowflake client used by scheduled batch reporting jobs in `e
 
 ---
 
-## 6. Collaboration Agreement with Data Platform (DPSD-8550)
-
-The Data Platform team owns `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL`. Our application is a consumer. The agreed contract is:
-
-| Contract Point | Agreement |
-|---|---|
-| **Column name** | `COURSE_PROGRESS` — value is a completion percentage (e.g. `0.75` for 75%) |
-| **Join key** | `ENTERPRISE_CUSTOMER_UUID` + `USER_EMAIL` + `COURSERUN_KEY` |
-| **Breaking changes** | Data Platform will not rename or remove `COURSE_PROGRESS`, `USER_EMAIL`, `COURSERUN_KEY`, or `ENTERPRISE_CUSTOMER_UUID` without coordinating with this team first |
-| **UUID format** | Stored without hyphens (`LOWER(REPLACE(...))` normalisation applied on our side) |
-| **Data lag** | ~daily refresh; consistent with the rest of the LPR |
-| **Application writes** | None — our application is read-only |
-
-If the Data Platform team needs to change the table schema or column semantics, they should file a coordination ticket and tag the Lakshy team before merging.
-
----
-
-## 7. Snowflake Authentication — Key Pair Migration
-
-### 7.1 The problem
-
-`ENTERPRISE_SERVICE_USER` (the account used by `SnowflakeCourseProgressSource`) is currently authenticating with username + password. Snowflake's new account-type policy (`LEGACY_SERVICE`) requires migration to **key pair authentication** by **end of August 2026**.
-
-### 7.2 Two Snowflake clients, two migrations needed
-
-| Client | File | Current auth | Needs migration? |
-|---|---|---|---|
-| `SnowflakeCourseProgressSource` | `enterprise_data/api/v1/views/lpr_data_source_snowflake.py` | `SNOWFLAKE_SERVICE_USER` + `SNOWFLAKE_SERVICE_USER_PASSWORD` Django settings | **Yes** |
-| `SnowflakeClient` | `enterprise_reporting/clients/snowflake.py` | `SNOWFLAKE_USERNAME` + `SNOWFLAKE_PASSWORD` env vars | **Yes** |
-
-### 7.3 What the code change looks like
-
-**Snowflake admin side** (Dave Wolf / Snowflake team):
-1. Generate RSA key pair for each service user.
-2. Register the public key: `ALTER USER <service_user> SET RSA_PUBLIC_KEY = '...'`.
-
-**Application side — `lpr_data_source_snowflake.py`:**
-
-```python
-# BEFORE
-connect_kwargs = {
-    'user': user,
-    'password': password,   # remove this
-    'account': account,
-}
-
-# AFTER
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
-
-private_key_pem = getattr(settings, 'SNOWFLAKE_PRIVATE_KEY_PEM', None)
-private_key = load_pem_private_key(private_key_pem.encode(), password=None)
-private_key_der = private_key.private_bytes(
-    encoding=serialization.Encoding.DER,
-    format=serialization.PrivateFormat.PKCS8,
-    encryption_algorithm=serialization.NoEncryption(),
-)
-
-connect_kwargs = {
-    'user': user,
-    'private_key': private_key_der,   # replaces 'password'
-    'account': account,
-}
-```
-
-The same pattern applies to `enterprise_reporting/clients/snowflake.py`.
-
-### 7.4 New settings / env vars
-
-| Setting | Purpose | How to store |
-|---|---|---|
-| `SNOWFLAKE_PRIVATE_KEY_PEM` | PEM-encoded RSA private key for `ENTERPRISE_SERVICE_USER` | Secrets manager (Vault / AWS Secrets Manager) |
-| `SNOWFLAKE_REPORTING_PRIVATE_KEY_PEM` | PEM-encoded RSA private key for reporting service user | Secrets manager |
-
-**Do not** commit private keys to git or `.env` files.
-
-### 7.5 Test changes required
-
-`enterprise_data/tests/lpr/test_lpr_data_source_snowflake.py` — `TestGetConnection` class currently mocks `SNOWFLAKE_SERVICE_USER_PASSWORD`. After migration, update tests to:
-- Mock `SNOWFLAKE_PRIVATE_KEY_PEM` instead.
-- Assert `private_key` (not `password`) is passed to `snowflake.connector.connect()`.
-
-### 7.6 Migration can be zero-downtime
-
-Because of graceful degradation (Section 9), the migration can be done safely:
-1. Add new key pair settings to the secrets manager in staging.
-2. Deploy the code change to staging and verify Snowflake queries succeed.
-3. Promote to production.
-4. Remove `SNOWFLAKE_SERVICE_USER_PASSWORD` from secrets manager once confirmed.
-
----
-
-## 8. Query Frequency Explained
+## 6. Query Frequency Explained
 
 There is no caching layer in front of the Snowflake call today (ticket `ENT0-9531` tracks adding one). The query fires on every LPR API request:
 
@@ -287,7 +253,7 @@ Each query is scoped tightly: one enterprise UUID, and only the `(user_email, co
 
 ---
 
-## 9. Graceful Degradation
+## 7. Graceful Degradation
 
 If the Snowflake call fails for any reason — wrong credentials, network timeout, table unavailable — the application **does not return an error to the caller**. Instead:
 
@@ -296,71 +262,12 @@ If the Snowflake call fails for any reason — wrong credentials, network timeou
 - A `WARNING` is logged with full traceback for observability.
 
 This design means:
-- The key pair migration (Section 7) can be tested safely without risking the LPR API.
+- Any future auth or connectivity change can be tested safely without risking the LPR API.
 - Any Snowflake outage has a bounded, predictable impact.
 
 ---
 
-## 10. Tickets to Be Created (Naveen)
-
-The following tickets should be created and added to the next sprint:
-
-### Ticket 1 — Discovery Documentation ✅ *(this document)*
-**Summary:** Document the LPR `course_progress` feature: history, architecture, and Snowflake connectivity.  
-**Type:** Task  
-**Status:** Done — this document fulfils it.
-
----
-
-### Ticket 2 — Migrate LPR Snowflake client to key pair authentication
-**Summary:** Replace username/password auth with RSA key pair in `SnowflakeCourseProgressSource`.  
-**Type:** Engineering task  
-**Priority:** Medium (must complete before end of August 2026)  
-**Acceptance Criteria:**
-- `lpr_data_source_snowflake.py` `_get_connection()` uses `private_key` (DER) instead of `password`.
-- Django setting `SNOWFLAKE_PRIVATE_KEY_PEM` is read from secrets manager in all environments.
-- `SNOWFLAKE_SERVICE_USER_PASSWORD` setting is removed.
-- `TestGetConnection` unit tests updated.
-- Verified working in staging before production deploy.
-
-**Dependencies:** Snowflake admin (Dave Wolf) must register the RSA public key for `ENTERPRISE_SERVICE_USER` before this can be validated end-to-end.
-
----
-
-### Ticket 3 — Migrate enterprise reporting Snowflake client to key pair authentication
-**Summary:** Replace username/password auth with RSA key pair in `enterprise_reporting/clients/snowflake.py` (`SnowflakeClient`).  
-**Type:** Engineering task  
-**Priority:** Medium (must complete before end of August 2026)  
-**Acceptance Criteria:**
-- `SnowflakeClient.__init__()` supports `private_key` in addition to / instead of `password`.
-- `SNOWFLAKE_PASSWORD` env var is removed from all environment configurations.
-- Reporting jobs verified working in staging.
-
----
-
-### Ticket 4 — Add caching in front of Snowflake LPR call (was ENT0-9531)
-**Summary:** Add a short-lived cache (e.g. Redis, per enterprise UUID) in front of `SnowflakeCourseProgressSource.get_course_progress_map()` to reduce Snowflake query frequency.  
-**Type:** Engineering task / performance improvement  
-**Priority:** Low–Medium  
-**Acceptance Criteria:**
-- Cache TTL aligned with Snowflake data refresh cadence (~1 day or configurable).
-- Cache can be bypassed / invalidated on demand.
-- Query volume observed in Snowflake query history drops significantly after deploy.
-
----
-
-### Ticket 5 — Coordinate schema stability agreement with Data Platform (DPSD-8550 follow-up)
-**Summary:** Formalise the contract between `edx-enterprise-data` and the Data Platform team for `LEARNER_PROGRESS_REPORT_INTERNAL` (and `_EXTERNAL`).  
-**Type:** Coordination / process  
-**Priority:** Low  
-**Acceptance Criteria:**
-- Data Platform team has this document or equivalent context.
-- A process is agreed for notifying `edx-enterprise-data` engineers before any breaking schema changes.
-- Column names, join keys, and data types are documented jointly.
-
----
-
-## 11. Summary for Snowflake Admin (Dave Wolf)
+## 8. Summary for Snowflake Admin (Dave Wolf)
 
 > The `ENTERPRISE_SERVICE_USER` queries you see in Snowflake's query history are **read-only SELECT statements** against `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL`. They are triggered in real time whenever an enterprise admin loads or exports their Learner Progress Report in the Admin Portal. The application **never writes to Snowflake** — data flows strictly one-way, from Snowflake into our API responses.
 >
