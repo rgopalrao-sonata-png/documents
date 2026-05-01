@@ -295,10 +295,4 @@ This design means:
 | **Is this a reverse ETL?** | No. The application is strictly read-only. It SELECTs one column (`COURSE_PROGRESS`) and never writes back. |
 | **Who requests these reports?** | Enterprise admin users (employees of enterprise customers) using the Admin Portal. Each page load or CSV export triggers a Snowflake query. |
 | **Why so frequently?** | Queries fire per API request with no caching layer today. Every page load and every CSV page triggers a new connection + SELECT. |
-| **Who would do the key pair migration?** | The Lakshy team (this repo). The code change is straightforward — swap `password` for `private_key` in the connector call. We need Dave's team to generate the RSA key pair and register the public key against `ENTERPRISE_SERVICE_USER` first. |
-
-### 8.2 Suggested response to Dave
-
-> The `ENTERPRISE_SERVICE_USER` queries you see in Snowflake's query history are **read-only SELECT statements** against `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL`. They are triggered in real time whenever an enterprise admin loads or exports their Learner Progress Report in the Admin Portal. The application **never writes to Snowflake** — data flows strictly one-way, from Snowflake into our API responses.
->
-> You are correct that the current auth method (username + password) needs to be upgraded to key pair auth. On our end, the code change is straightforward — we swap `password` for `private_key` in the connector call. We need your team to generate the RSA key pair and register the public key against `ENTERPRISE_SERVICE_USER` (and the reporting service user) as a prerequisite. We are well within the August deadline and will share the Jira ticket links once created.
+| **Who would do the key pair migration?** | The Lakshy team (this repo). The code change is straightforward — swap `password` for `private_key` in the connector call. We need respective team to generate the RSA key pair and register the public key against `ENTERPRISE_SERVICE_USER` first. |
