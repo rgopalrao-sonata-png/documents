@@ -1,8 +1,6 @@
 # Learner Progress Report — `course_progress` Field: Full Technical History & Current State
 
 > **Audience:** Engineering, Product, Data Platform, Snowflake Admins  
-> **Owner team:** Lakshy (Tech Lead: Ramya Gopal Rao; BA/SM: Naveen Naga Kumar Geddada)  
-> **Stakeholders:** Brian Beggs, Dave Wolf (Snowflake admin)  
 > **Related tickets:** [ENT-9207](https://2u-internal.atlassian.net/browse/ENT-9207) (discovery), [ENT-11183](https://2u-internal.atlassian.net/browse/ENT-11183) (implementation), [DPSD-8550](https://2u-internal.atlassian.net/browse/DPSD-8550) (Data Platform — Snowflake table), ENT0-9531 (caching)  
 > **Data Platform PR:** [warehouse-transforms#7163](https://github.com/edx/warehouse-transforms/pull/7163/changes)  
 > **Status as of May 2026:** `course_progress` is live in production, reading from `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL`. Snowflake auth migration to key pair is pending (deadline: end of August 2026).  
