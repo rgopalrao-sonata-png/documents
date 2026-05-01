@@ -1,8 +1,6 @@
 # Learner Progress Report — `course_progress` Field: Full Technical History & Current State
 
 > **Audience:** Engineering, Product, Data Platform, Snowflake Admins  
-> **Owner team:** Lakshy (Tech Lead: Ramya Gopal Rao; BA/SM: Naveen Naga Kumar Geddada)  
-> **Stakeholders:** Brian Beggs, Dave Wolf (Snowflake admin)  
 > **Related tickets:** [ENT-9207](https://2u-internal.atlassian.net/browse/ENT-9207) (discovery), [ENT-11183](https://2u-internal.atlassian.net/browse/ENT-11183) (implementation), [DPSD-8550](https://2u-internal.atlassian.net/browse/DPSD-8550) (Data Platform — Snowflake table), ENT0-9531 (caching)  
 > **Data Platform PR:** [warehouse-transforms#7163](https://github.com/edx/warehouse-transforms/pull/7163/changes)  
 > **Status as of May 2026:** `course_progress` is live in production, reading from `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL`. Snowflake auth migration to key pair is pending (deadline: end of August 2026).  
@@ -257,7 +255,7 @@ These are **not** automated batch jobs or cron-triggered exports. They are real-
 
 ### 6.2 Why so frequent?
 
-There is no caching layer in front of the Snowflake call today (ticket `ENT0-9531` tracks adding one). A new Snowflake query fires on every LPR API request:
+The current implementation queries Snowflake on every LPR API request to ensure enterprise admins always receive the **most up-to-date** `course_progress` values available in the warehouse. Each query is scoped tightly to one enterprise UUID and only the exact `(user_email, courserun_key)` pairs on the current page — no full-table scans.
 
 | Trigger | When it fires |
 |---|---|
@@ -265,9 +263,7 @@ There is no caching layer in front of the Snowflake call today (ticket `ENT0-953
 | Admin Portal CSV export | Once per `ENROLLMENTS_PAGE_SIZE` rows streamed |
 | API integrations / automated tooling | Depends on the polling interval of the client |
 
-Connections are opened and closed per call — there is no persistent connection pool. This contributes to the volume of login events visible in Snowflake's query history.
-
-Each query is scoped tightly: one enterprise UUID, and only the `(user_email, courserun_key)` pairs on that specific page. No full-table scans.
+**Planned improvement — `ENT0-9531`:** We have already identified and scoped a caching layer to sit in front of the Snowflake call. Since `COURSE_PROGRESS` data refreshes only ~daily, a short-lived cache keyed per enterprise will eliminate redundant queries within the same refresh window — significantly reducing the query volume Dave Wolf observed, while keeping the data as fresh as the underlying pipeline allows. 
 
 ---
 
@@ -286,7 +282,7 @@ This design means:
 
 ---
 
-## 8. Summary for Dave Wolf
+## 8. Summary for Snowflake Admin (Dave Wolf)
 
 ### 8.1 Answers to Dave's questions
 
