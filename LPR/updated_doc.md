@@ -27,7 +27,7 @@
     - [2.5 Why `course_progress` Doesn't Travel Through the Standard Pipeline](#25-why-course_progress-doesnt-travel-through-the-standard-pipeline)
 3. [How We Solved It — Current Implementation (ENT-11183)](#3-how-we-solved-it--current-implementation-ent-11183)
 4. [Architecture & Data Flow](#4-architecture--data-flow)
-    - [4.0 Standard Batch Flow vs `course_progress` Exception Path](#40-standard-batch-flow-vs-course_progress-exception-path)
+    - [4.0 Base LPR Batch Pipeline](#40-base-lpr-batch-pipeline)
     - [4.1 High-Level System Architecture (including course_progress enrichment)](#41-high-level-system-architecture)
     - [4.2 Request-Time Sequence](#42-request-time-sequence)
 5. [Code Walkthrough](#5-code-walkthrough)
@@ -154,33 +154,20 @@ This bypassed both failed approaches from ENT-9207:
 
 ## 4. Architecture & Data Flow
 
-### 4.0 Standard Batch Flow vs `course_progress` Exception Path
+### 4.0 Base LPR Batch Pipeline
 
 The vast majority of LPR fields — grades, enrollment dates, user details, offer info — travel through a **daily batch pipeline** that is completely separate from the Snowflake enrichment described in the rest of this document. Understanding this pipeline is essential context for any schema change or new column addition.
 
 ```mermaid
 flowchart LR
-    subgraph LEFT["Standard batch path — all base LPR fields"]
-        SVC["All edX services\ngrades, enrollments, users, offers"] --> RAW["Snowflake\nraw warehouse data"]
-        RAW --> DBT["warehouse-transforms (dbt)\nlearner_progress_report_external.sql"]
-        DBT --> S3["S3 CSV export\nperform_s3_transfers macro"]
-        S3 --> PF["Prefect flow\nload_enterprise_tables_from_s3_to_aurora\nprod.toml lines 137–190"]
-        PF --> ADB["Aurora MySQL\nenterprise_reporting DB"]
-        ADB --> TBL["enterprise_learner_enrollment"]
-        TBL --> ORM["Django ORM\nEnterpriseLearnerEnrollment"]
-    end
+    SVC["All edX services\ngrades, enrollments, users, offers"] --> RAW["Snowflake\nraw warehouse data"]
+    RAW --> DBT["warehouse-transforms (dbt)\nlearner_progress_report_external.sql"]
+    DBT --> S3["S3 CSV export\nperform_s3_transfers macro"]
+    S3 --> PF["Prefect flow\nload_enterprise_tables_from_s3_to_aurora\nprod.toml lines 137–190"]
+    PF --> ADB["Aurora MySQL\nenterprise_reporting DB"]
+    ADB --> TBL["enterprise_learner_enrollment"]
+    TBL --> ORM["Django ORM\nEnterpriseLearnerEnrollment"]
 
-    subgraph RIGHT["Request-time enrichment path — course_progress only"]
-        LMS["LMS / Completion API"] --> DP["Data Platform\npublishes LMS-calculated value"]
-        DP --> SFI["Snowflake\nPROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL"]
-        SFI --> API["Request-time Snowflake read\nSnowflakeCourseProgressSource"]
-        API --> MERGE["Merged into LPR API response"]
-    end
-
-    ORM -. "base LPR fields" .-> MERGE
-
-    style LEFT fill:#eef4ff,stroke:#1a73e8,color:#000
-    style RIGHT fill:#fff7e6,stroke:#e65100,color:#000
     style SVC fill:#dbeafe,stroke:#1a73e8,color:#000
     style RAW fill:#ffe0b2,stroke:#e65100,color:#000
     style DBT fill:#ffe0b2,stroke:#e65100,color:#000
@@ -189,14 +176,9 @@ flowchart LR
     style ADB fill:#f8bbd0,stroke:#c62828,color:#000
     style TBL fill:#f8bbd0,stroke:#c62828,color:#000
     style ORM fill:#f8bbd0,stroke:#c62828,color:#000
-    style LMS fill:#dbeafe,stroke:#1a73e8,color:#000
-    style DP fill:#ffe0b2,stroke:#e65100,color:#000
-    style SFI fill:#fff8e1,stroke:#f57f17,color:#000
-    style API fill:#c8e6c9,stroke:#2e7d32,color:#000
-    style MERGE fill:#a5d6a7,stroke:#2e7d32,color:#000
 ```
 
-**Flow summary:** The left side shows the standard batch pipeline used for all base LPR fields. The right side shows the exception path for `course_progress`, which is published into Snowflake by Data Platform and read at request time before the final API response is assembled.
+**Flow summary:** All non-`course_progress` LPR fields are modeled in dbt, exported to S3, loaded into Aurora by Prefect, and then served through the Django ORM.
 
 #### Key pipeline facts
 
