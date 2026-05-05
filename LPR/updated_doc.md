@@ -452,12 +452,9 @@ def _enrich_course_progress_rows(self, rows):
 #### Observability and rollout
 
 - **Metrics/log counters:** cache hit, miss, set, set-failure, Snowflake-fallback — log at `INFO` level including enterprise UUID and row count. Never log the payload itself.
-- **Feature flag:** gate the caching path behind a waffle flag (`lpr_course_progress_cache_enabled`) so hit rate and impact can be validated per-request before full rollout.
-- **Validation:** compare DataDog Snowflake connectivity/query log event counts at the same traffic level before and after enabling the flag. Target: ≥70% reduction in events for enterprises with active Admin Portal sessions.
-
 #### Why not cache the full view response?
 
-For completeness: the prior `TieredCache` regression on `EnterpriseLearnerEnrollmentViewSet` returned the same response regardless of filter parameters because the cache key did not incorporate query params. That bug was removed rather than fixed. This design deliberately does not reintroduce response-level caching. The enrichment map is the only safe artifact to cache here because its correctness does not depend on request-level parameters.
+For completeness: the prior `TieredCache` regression on `EnterpriseLearnerEnrollmentViewSet` returned the same response regardless of filter parameters because the cache key did not incorporate query params.This design deliberately does not reintroduce response-level caching. The enrichment map is the only safe artifact to cache here because its correctness does not depend on request-level parameters.
 
 ---
 
