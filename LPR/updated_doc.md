@@ -131,7 +131,7 @@ The reason it is **not** pushed through the full Aurora pipeline is pragmatic: a
 | Snowflake-connectivity log events | ~11,000 |
 | Enrollment API log events | ~8,000 |
 
-These are operational log lines, not 1:1 SQL statement counts — a single API request may produce multiple connection and query log entries. Even so, they are directionally useful: the traffic profile is consistent with interactive Admin Portal usage (page loads, pagination, CSV exports) plus any downstream polling integrations. The planned caching layer ([ENT0-9531](https://2u-internal.atlassian.net/browse/ENT0-9531)) should materially reduce repeat reads inside the same refresh window without changing the underlying data contract. Implementation of that query-reduction work is now tracked in [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788).
+These are operational log lines, not 1:1 SQL statement counts — a single API request may produce multiple connection and query log entries. Even so, they are directionally useful: the traffic profile is consistent with interactive Admin Portal usage (page loads, pagination, CSV exports) plus any downstream polling integrations. The planned caching layer ([ENT0-9531](https://2u-internal.atlassian.net/browse/ENT0-9531)) should materially reduce repeat reads inside the same refresh window without changing the underlying data contract. Implementation of that query-reduction work will be tracked in [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788).
 
 ---
 
