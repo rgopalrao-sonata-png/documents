@@ -15,7 +15,7 @@
 - The production solution is to read the **LMS-calculated value** from Snowflake table `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL` and merge it into the LPR response at request time.
 - All other LPR fields continue to flow through the standard **Snowflake → S3 → Aurora → Django ORM** batch pipeline.
 - The integration is **read-only** and **gracefully degrading**: if Snowflake is unavailable, only `course_progress` becomes `null`; the rest of the report still returns successfully.
-- The main operational follow-up is reducing repeated request-time reads via [ENT0-9531](https://2u-internal.atlassian.net/browse/ENT0-9531), with implementation now tracked in subtask [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788), and completing the pending Snowflake key-pair authentication migration.
+- The main operational follow-up is reducing repeated request-time reads via [ENT0-9531](https://2u-internal.atlassian.net/browse/ENT0-9531), with implementation now tracked in  [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788), and completing the pending Snowflake key-pair authentication migration.
 
 ---
 
