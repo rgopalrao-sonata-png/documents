@@ -1,7 +1,7 @@
 # Learner Progress Report — `course_progress` Field: Full Technical History & Current State
 
 > **Audience:** Engineering, Product, Data Platform, Snowflake Admins  
-> **Related tickets:** [ENT-9207](https://2u-internal.atlassian.net/browse/ENT-9207) (discovery), [ENT-11183](https://2u-internal.atlassian.net/browse/ENT-11183) (implementation), [DPSD-8550](https://2u-internal.atlassian.net/browse/DPSD-8550) (Data Platform — Snowflake table), ENT0-9531 (caching)  
+> **Related tickets:** [ENT-5795](https://2u-internal.atlassian.net/browse/ENT-5795) (original discovery, ~2022), [ENT-9207](https://2u-internal.atlassian.net/browse/ENT-9207) (second discovery), [ENT-11183](https://2u-internal.atlassian.net/browse/ENT-11183) (implementation), [DPSD-8550](https://2u-internal.atlassian.net/browse/DPSD-8550) (Data Platform — Snowflake table), ENT0-9531 (caching)  
 > **Data Platform PR:** [warehouse-transforms#7163](https://github.com/edx/warehouse-transforms/pull/7163/changes)  
 > **Status as of May 2026:** `course_progress` is live in production, reading from `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL`. Snowflake auth migration to key pair is pending (deadline: end of August 2026).  
 > **Origin:** Slack thread initiated by Dave Wolf (Snowflake team) regarding `ENTERPRISE_SERVICE_USER` still authenticating via username/password.
@@ -12,12 +12,17 @@
 
 1. [Business Context & Customer Need](#1-business-context--customer-need)
 2. [Previous Discovery Attempts & Why They Failed](#2-previous-discovery-attempts--why-they-failed)
+    - [2.5 Why `course_progress` Doesn't Travel Through the Standard Pipeline](#25-why-course_progress-doesnt-travel-through-the-standard-pipeline)
 3. [How We Solved It — Current Implementation (ENT-11183)](#3-how-we-solved-it--current-implementation-ent-11183)
 4. [Architecture & Data Flow](#4-architecture--data-flow)
+    - [4.0 Full LPR Base Data Pipeline (All Fields Except course_progress)](#40-full-lpr-base-data-pipeline-all-fields-except-course_progress)
+    - [4.1 High-Level System Architecture (including course_progress enrichment)](#41-high-level-system-architecture)
+    - [4.2 Request-Time Sequence](#42-request-time-sequence)
 5. [Code Walkthrough](#5-code-walkthrough)
 6. [Query Frequency Explained](#6-query-frequency-explained)
 7. [Graceful Degradation](#7-graceful-degradation)
 8. [Summary for Snowflake Admin (Dave Wolf)](#8-summary-for-snowflake-admin-dave-wolf)
+9. [Open Questions & Change Guidance](#9-open-questions--change-guidance)
 
 ---
 
@@ -63,6 +68,61 @@ Two approaches were explored:
 
 ---
 
+## 2.5 Why `course_progress` Doesn't Travel Through the Standard Pipeline
+
+A question that comes up regularly: *If most LPR data flows through the Snowflake → S3 → Aurora batch pipeline, why does `course_progress` bypass that pipeline and get fetched real-time?* The answer is rooted in two prior failed attempts and a data provenance constraint.
+
+### The Standard Pipeline Has a ~1-Day Lag
+
+The batch pipeline (dbt → S3 → Aurora) is designed for throughput, not freshness. Data is a full calendar day behind what learners see in the LMS at any given moment. For most LPR fields (grades, enrollment dates, offer info) this is acceptable. For course progress it was debated:
+
+> *"LPR data lags real time by one day. So if we add the progress into the LPR pipeline, it can create confusion — the data in the LPR is a day old, but the learner sees the latest progress in the LMS."* — Ammar (ENT-9207 grooming)
+>
+> *"We can defend a data lag as long as the data provenance is good."* — NR (Product)
+
+### Attempt 1 (circa 2022) — Calculate it in the Warehouse
+
+Ticket [ENT-5795](https://2u-internal.atlassian.net/browse/ENT-5795) (the predecessor discovery) attempted to derive the progress percentage from block-level completion data already in Snowflake. The problem: `course_progress` isn't a raw event — it's a **calculated metric**. The LMS applies course-specific weighting, block-type exclusions, and visibility rules to produce the number a learner sees. Replicating that logic in dbt SQL produced results that didn't match what learners saw in-course. Even small discrepancies (~1-2%) cause support escalations because admins and learners compare notes directly. The attempt was abandoned.
+
+### Attempt 2 (ENT-9207) — Call the LMS API Directly
+
+The outcome of ENT-9207 was to use the LMS Completion API endpoint directly at query time:
+
+```
+{LMS_BASE_URL}/api/course_home/progress/{courseId}/{targetUserId}/
+```
+
+This was chosen because it is the **same source of truth the learner sees** — no calculation mismatch possible. However, this approach also hit a wall:
+
+- The LMS endpoint requires user context and was not designed for bulk, unauthenticated machine-to-machine calls.
+- Our batch pipeline has no mechanism to fan out thousands of LMS API calls per enterprise per day.
+- At scale (large enterprises, thousands of enrollments) this would have hammered the LMS and likely caused rate-limit failures.
+
+The effort was suspended again.
+
+### Why Real-Time Snowflake Is the Right Answer
+
+The breakthrough (ENT-11183 / DPSD-8550) was the Data Platform team surfacing the pre-calculated `COURSE_PROGRESS` value — the LMS's own computed number — directly into `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL`. This solved both prior blockers:
+
+| Blocker | How Snowflake Solves It |
+|---|---|
+| Can't calculate it ourselves accurately | Data Platform brings the LMS-calculated value into Snowflake — we SELECT it, we don't compute it |
+| Can't call the LMS API at scale | The pipeline does that work in batch; we just query the result |
+| Pipeline lag concern | Snowflake is queried at request time — admins always get the freshest value the Data Platform has written, not a further-delayed copy in Aurora |
+
+The reason it is **not** pushed through the full Aurora pipeline is pragmatic: adding it to Aurora would introduce an **additional** day of lag on top of the Data Platform's refresh cadence. Querying Snowflake directly at request time means admins get the value as soon as the Data Platform has written it — with no extra copy delay. Given that `course_progress` is the one field where data freshness/provenance requirements are the sharpest (it must match what the learner sees), the direct Snowflake query was the correct tradeoff.
+
+### Observed Query Volume (DataDog snapshot, ~May 2026)
+
+| Signal | Approximate count/day |
+|---|---|
+| Snowflake-connectivity log events | ~11,000 |
+| Enrollment API log events | ~8,000 |
+
+These are operational log lines, not 1:1 SQL statement counts — a single API request may produce multiple log lines. The volumes confirm this is driven by enterprise admins using the Admin Portal (page loads, pagination, CSV exports) and any API integrations polling on a schedule. The planned caching layer (`ENT0-9531`) will eliminate duplicate Snowflake queries within each ~daily refresh window, substantially reducing these numbers.
+
+---
+
 ## 3. How We Solved It — Current Implementation (ENT-11183)
 
 The breakthrough came when the Data Platform team (ticket **[DPSD-8550](https://2u-internal.atlassian.net/browse/DPSD-8550)**) confirmed they could surface the pre-calculated `COURSE_PROGRESS` value — the same value the LMS exposes to learners — directly in a Snowflake table: `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL`. The Data Platform's work was delivered via [warehouse-transforms#7163](https://github.com/edx/warehouse-transforms/pull/7163/changes).
@@ -82,17 +142,65 @@ This bypassed both failed approaches from ENT-9207:
 
 ## 4. Architecture & Data Flow
 
+### 4.0 Full LPR Base Data Pipeline (All Fields Except `course_progress`)
+
+The vast majority of LPR fields — grades, enrollment dates, user details, offer info — travel through a **daily batch pipeline** that is completely separate from the Snowflake enrichment described in the rest of this document. Understanding this pipeline is essential context for any schema change or new column addition.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     DAILY BATCH PIPELINE  (all base LPR fields)             │
+│                                                                             │
+│  All edX services  ──►  Snowflake (raw)  ──►  warehouse-transforms (dbt)   │
+│                                                     │                       │
+│                           learner_progress_report_external.sql              │
+│                           (admin_dash dbt model)                            │
+│                                │                                            │
+│                    perform_s3_transfers macro                                │
+│                          (writes CSV to S3)                                 │
+│                                │                                            │
+│                     Prefect flow: load_enterprise_tables_from_s3_to_aurora  │
+│                          (prod.toml lines 137-190)                          │
+│                                │                                            │
+│              Aurora MySQL  ──  enterprise_reporting DB                      │
+│              host: prod-edx-enterprise-reporting-readonly                   │
+│              table: enterprise_learner_enrollment                           │
+│                                │                                            │
+│              Django model: EnterpriseLearnerEnrollment                      │
+│              (edx-enterprise-data/enterprise_data/models.py)                │
+│              DATABASES alias: 'enterprise'                                   │
+│              (edx-analytics-data-api settings/base.py)                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Key pipeline facts
+
+| Property | Detail |
+|---|---|
+| **Refresh cadence** | Daily — the dbt macro has no explicit schedule tag beyond the daily run |
+| **Table lifecycle** | The `enterprise_learner_enrollment` table is effectively **truncated and reloaded** each day by the Prefect flow |
+| **Schema management** | Adding a new column requires: (1) updating the dbt model SQL, (2) updating the Prefect `.toml` loading config, (3) updating the `EnterpriseLearnerEnrollment` Django model field, (4) updating API serialization. Django migrations exist for local dev but the prod DB schema is driven by the Prefect load definition — confirm whether `django_migrations` table exists in `enterprise_reporting` before assuming ORM migrations run in prod |
+| **Read-only DB** | The Django app connects to a read-replica; only the Prefect flow writes to this DB |
+| **Source of truth refs** | [warehouse-transforms base models](https://github.com/edx/warehouse-transforms/tree/ab8dd5fd305b80f07e47c807c02c54a8a202112f/projects/reporting/models/data_marts/enterprise/base) · [learner_progress_report_external.sql](https://github.com/edx/warehouse-transforms/blob/ab8dd5fd305b80f07e47c807c02c54a8a202112f/projects/reporting/models/data_marts/enterprise/admin_dash/learner_progress_report_external.sql) · [perform_s3_transfers.sql](https://github.com/edx/warehouse-transforms/blob/master/projects/reporting/macros/perform_s3_transfers.sql) · [Prefect flow prod.toml L137-190](https://github.com/edx/prefect-flows/blob/7d726b79ad8300434d6ddd5ccbd86940485368ed/flows/load_enterprise_tables_from_s3_to_aurora/prod.toml#L137-L190) |
+
+---
+
 ### 4.1 High-Level System Architecture
 
 ```mermaid
 graph TB
     subgraph UPSTREAM["UPSTREAM SYSTEMS"]
         LMS["LMS / edX Platform\n(Completion API)"]
-        DP["Data Platform Pipeline\n(DPSD-8550)\n~daily batch refresh"]
+        SVC["All edX services\n(grades, enrollments, users…)"]
+        DP["Data Platform / dbt\n(warehouse-transforms)\n~daily batch refresh"]
+    end
+
+    subgraph AURORA["AURORA MySQL — enterprise_reporting"]
+        AU_TABLE["enterprise_learner_enrollment\nhost: prod-edx-enterprise-reporting-readonly\n\nAll base LPR fields:\ngrades, dates, enrollment info,\nuser details, offer info…"]
     end
 
     subgraph SNOWFLAKE["SNOWFLAKE"]
-        SF_TABLE["PROD.ENTERPRISE\n.LEARNER_PROGRESS_REPORT_INTERNAL\n\nColumns used:\n• ENTERPRISE_CUSTOMER_UUID\n• USER_EMAIL\n• COURSERUN_KEY\n• COURSE_PROGRESS ← only field read"]
+        SF_INT["PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL\n(internal — course_progress source)"]
+        SF_EXT["learner_progress_report_external\n(dbt model → CSV → S3 → Aurora via Prefect)"]
     end
 
     subgraph APP["edx-enterprise-data (this repo)"]
@@ -109,9 +217,13 @@ graph TB
         CSV["CSV Download\n(StreamingHttpResponse)\nGET /enrollments/?format=csv"]
     end
 
-    LMS -- "batch\n(completion events)" --> DP
-    DP -- "writes\nCOURSE_PROGRESS" --> SF_TABLE
-    SF_TABLE -- "SELECT (read-only)\nper API request" --> SFC
+    SVC -- "raw event data" --> DP
+    LMS -- "batch completion events" --> DP
+    DP -- "dbt model + S3 macro" --> SF_EXT
+    SF_EXT -- "Prefect flow (daily)" --> AU_TABLE
+    AU_TABLE -- "Django ORM\nDATABASES['enterprise']" --> ORM
+    DP -- "writes COURSE_PROGRESS" --> SF_INT
+    SF_INT -- "SELECT (read-only)\nper API request" --> SFC
     ORM --> MERGE
     SFC --> MERGE
     MERGE --> RESULT
@@ -119,10 +231,13 @@ graph TB
     RESULT --> CSV
 
     style UPSTREAM fill:#e8f4fd,stroke:#1a73e8,color:#000
+    style AURORA fill:#fce4ec,stroke:#c62828,color:#000
     style SNOWFLAKE fill:#fff3e0,stroke:#e65100,color:#000
     style APP fill:#e8f5e9,stroke:#2e7d32,color:#000
     style CONSUMERS fill:#f3e5f5,stroke:#7b1fa2,color:#000
-    style SF_TABLE fill:#fff8e1,stroke:#f57f17,color:#000
+    style SF_INT fill:#fff8e1,stroke:#f57f17,color:#000
+    style SF_EXT fill:#ffe0b2,stroke:#e65100,color:#000
+    style AU_TABLE fill:#fce4ec,stroke:#c62828,color:#000
     style ORM fill:#c8e6c9,stroke:#388e3c,color:#000
     style SFC fill:#c8e6c9,stroke:#388e3c,color:#000
     style MERGE fill:#a5d6a7,stroke:#2e7d32,color:#000
