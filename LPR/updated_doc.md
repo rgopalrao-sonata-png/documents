@@ -82,7 +82,7 @@ Two approaches were explored:
 
 ## 2.5 Why `course_progress` Doesn't Travel Through the Standard Pipeline
 
-A recurring question is: *If most LPR data flows through the Snowflake → S3 → Aurora batch pipeline, why does `course_progress` bypass that path and get fetched from Snowflake at request time?* The answer is rooted in two failed earlier approaches and one core design principle: this field must match the learner-facing LMS value closely enough that provenance matters more than architectural uniformity.
+Question is: *If most LPR data flows through the Snowflake → S3 → Aurora batch pipeline, why does `course_progress` bypass that path and get fetched from Snowflake at request time?* The answer is rooted in two failed earlier approaches and one core design principle: this field must match the learner-facing LMS value closely enough that provenance matters more than architectural uniformity.
 
 ### The Standard Pipeline Has a ~1-Day Lag
 
