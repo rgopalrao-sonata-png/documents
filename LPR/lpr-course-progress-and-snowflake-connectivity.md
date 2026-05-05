@@ -1,7 +1,7 @@
 # Learner Progress Report — `course_progress` Field: Full Technical History & Current State
 
 > **Audience:** Engineering, Product, Data Platform, Snowflake Admins  
-> **Related tickets:** [ENT-5795](https://2u-internal.atlassian.net/browse/ENT-5795) (original discovery, ~2022), [ENT-9207](https://2u-internal.atlassian.net/browse/ENT-9207) (second discovery), [ENT-11183](https://2u-internal.atlassian.net/browse/ENT-11183) (implementation), [DPSD-8550](https://2u-internal.atlassian.net/browse/DPSD-8550) (Data Platform — Snowflake table), [ENT0-9531](https://2u-internal.atlassian.net/browse/ENT0-9531) (caching initiative), [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788) (cache implementation subtask to reduce frequent Snowflake reads)  
+> **Related tickets:** [ENT-5795](https://2u-internal.atlassian.net/browse/ENT-5795) (original discovery, ~2022), [ENT-9207](https://2u-internal.atlassian.net/browse/ENT-9207) (second discovery), [ENT-11183](https://2u-internal.atlassian.net/browse/ENT-11183) (implementation), [DPSD-8550](https://2u-internal.atlassian.net/browse/DPSD-8550) (Data Platform — Snowflake table), [ENT-9531](https://2u-internal.atlassian.net/browse/ENT-9531) (caching initiative), [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788) (cache implementation subtask to reduce frequent Snowflake reads)  
 > **Data Platform PR:** [warehouse-transforms#7163](https://github.com/edx/warehouse-transforms/pull/7163/changes)  
 > **Status as of May 2026:** `course_progress` is live in production, reading from `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL`. Snowflake auth migration to key pair is pending (deadline: end of August 2026).  
 > **Origin:** Slack thread initiated by Dave Wolf (Snowflake team) regarding `ENTERPRISE_SERVICE_USER` still authenticating via username/password.
@@ -15,7 +15,7 @@
 - The production solution is to read the **LMS-calculated value** from Snowflake table `PROD.ENTERPRISE.LEARNER_PROGRESS_REPORT_INTERNAL` and merge it into the LPR response at request time.
 - All other LPR fields continue to flow through the standard **Snowflake → S3 → Aurora → Django ORM** batch pipeline.
 - The integration is **read-only** and **gracefully degrading**: if Snowflake is unavailable, only `course_progress` becomes `null`; the rest of the report still returns successfully.
-- The main operational follow-up is reducing repeated request-time reads via [ENT0-9531](https://2u-internal.atlassian.net/browse/ENT0-9531), with implementation will be  tracked in  [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788), and completing the pending Snowflake key-pair authentication migration will be implemented in [ENT-11804](https://2u-internal.atlassian.net/browse/ENT-11804)
+- The main operational follow-up is reducing repeated request-time reads via [ENT-9531](https://2u-internal.atlassian.net/browse/ENT-9531), with implementation tracked in [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788), using a short-lived **5-minute cache** to reduce redundant calls while minimizing stale data exposure. The pending Snowflake key-pair authentication migration is tracked in [ENT-11804](https://2u-internal.atlassian.net/browse/ENT-11804).
 
 ---
 
@@ -131,7 +131,7 @@ The reason it is **not** pushed through the full Aurora pipeline is pragmatic: a
 | Snowflake-connectivity log events | ~11,000 |
 | Enrollment API log events | ~8,000 |
 
-These are operational log lines, not 1:1 SQL statement counts — a single API request may produce multiple connection and query log entries. Even so, they are directionally useful: the traffic profile is consistent with interactive Admin Portal usage (page loads, pagination, CSV exports) plus any downstream polling integrations. The planned caching layer ([ENT0-9531](https://2u-internal.atlassian.net/browse/ENT0-9531)) should materially reduce repeat reads inside the same refresh window without changing the underlying data contract. Implementation of that query-reduction work will be tracked in [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788).
+These are operational log lines, not 1:1 SQL statement counts — a single API request may produce multiple connection and query log entries. Even so, they are directionally useful: the traffic profile is consistent with interactive Admin Portal usage (page loads, pagination, CSV exports) plus any downstream polling integrations. The planned caching layer ([ENT-9531](https://2u-internal.atlassian.net/browse/ENT-9531)) should materially reduce repeat reads while still keeping data fresh by using a short **5-minute cache window**. Implementation of that query-reduction work is tracked in [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788).
 
 ---
 
@@ -366,6 +366,96 @@ File: `enterprise_reporting/clients/snowflake.py`
 
 An **independent** Snowflake client used by scheduled batch reporting jobs in `enterprise_reporting/`. It uses separate credentials (`SNOWFLAKE_USERNAME` / `SNOWFLAKE_PASSWORD` env vars) and is unrelated to the LPR enrichment flow described above.
 
+### 5.5 Proposed Caching Layer (ENT-9531 / ENT-11788)
+
+#### Context and cache boundary decision
+
+The observed Snowflake load — ~11,000 connectivity log events per day — is primarily caused by bursty repeated reads from the same enterprise: pagination events, CSV export pages, and manual refreshes, all triggering the same Snowflake query for the same enterprise's `COURSE_PROGRESS` values within a short window.
+
+The correct response is **not** to cache the full `EnterpriseLearnerEnrollmentViewSet` HTTP response. A previous attempt to do that was removed because the response varies with query params (filters, ordering, pagination, format) — a single cache key cannot safely cover all combinations. Caching the rendered response would risk returning wrong data for different filter states.
+
+The right cache boundary is the **Snowflake enrichment result only**: the `{(user_email, courserun_key): course_progress}` map returned by `SnowflakeCourseProgressSource`. This map is:
+- keyed only to enterprise UUID and latest Snowflake snapshot
+- independent of ORM filtering, page number, and renderer format
+- reusable safely across all requests for the same enterprise within the TTL window
+
+#### Cache specification
+
+| Property | Value |
+|---|---|
+| **Backend** | `enterprise_data.cache` → `TieredCache` (RequestCache + Django shared cache backend) |
+| **Cache key** | `lpr:course_progress:<normalized_enterprise_uuid>` where `normalized_enterprise_uuid = uuid.lower().replace('-', '')` |
+| **Cached value** | `dict[tuple[str, str], float \| None]` — full enterprise enrichment map: `{(lower(user_email), strip(courserun_key)): course_progress}` |
+| **TTL** | `300 seconds` (5 minutes), configurable via `settings.LPR_COURSE_PROGRESS_CACHE_TIMEOUT` |
+| **Cache scope** | Per-enterprise; all page requests and CSV export pages for the same enterprise share one cache entry within the TTL window |
+
+> **Why 5 minutes?** It is long enough to absorb all pages of a typical admin session (pagination, CSV export, refresh) and short enough that the maximum observable data age remains within the LPR's existing tolerated lag window. The upstream Snowflake data itself refreshes approximately daily, so a 5-minute cache introduces no meaningful regression relative to the batch refresh cadence.
+
+#### Implementation
+
+The cache logic should live in `_enrich_course_progress_rows()`, wrapping the call to `SnowflakeCourseProgressSource`:
+
+```python
+COURSE_PROGRESS_CACHE_TIMEOUT = 300  # 5 minutes; override via settings.LPR_COURSE_PROGRESS_CACHE_TIMEOUT
+
+def _get_course_progress_map_cached(self, enterprise_uuid: str, rows) -> dict:
+    timeout = getattr(settings, 'LPR_COURSE_PROGRESS_CACHE_TIMEOUT', COURSE_PROGRESS_CACHE_TIMEOUT)
+    normalized = enterprise_uuid.lower().replace('-', '')
+    cache_key = cache.get_key('lpr_course_progress', normalized)
+
+    cached = cache.get(cache_key)
+    if cached.is_found:
+        LOGGER.info('[course_progress] Cache HIT for enterprise %s', normalized)
+        return cached.value
+
+    LOGGER.info('[course_progress] Cache MISS for enterprise %s — querying Snowflake', normalized)
+    progress_map = SnowflakeCourseProgressSource().get_course_progress_map(enterprise_uuid, rows)
+    cache.set(cache_key, progress_map, timeout=timeout)
+    return progress_map
+```
+
+Then `_enrich_course_progress_rows()` calls `_get_course_progress_map_cached()` instead of calling `SnowflakeCourseProgressSource` directly:
+
+```python
+def _enrich_course_progress_rows(self, rows):
+    self._enrich_course_passing_grade_rows(rows)
+    try:
+        if not rows:
+            return rows
+        enterprise_uuid = self.kwargs['enterprise_id']
+        progress_map = self._get_course_progress_map_cached(enterprise_uuid, rows)
+        for row in rows:
+            key = (
+                row.get('user_email', '').strip().lower(),
+                row.get('courserun_key', '').strip(),
+            )
+            if key in progress_map:
+                row['course_progress'] = progress_map[key]
+        return rows
+    except Exception:  # pylint: disable=broad-exception-caught
+        LOGGER.warning('Could not enrich course_progress from Snowflake', exc_info=True)
+        return rows
+```
+
+> **Key normalization:** both the cached map keys and the merge-path lookup keys must use the same normalization: `lower(user_email)`, `strip(courserun_key)`. A mismatch here would produce false cache misses and incorrect merges even with a valid cached payload.
+
+#### Failure modes and guarantees
+
+| Scenario | Behavior |
+|---|---|
+| Cache HIT, Snowflake not called | `course_progress` values from cache merged into rows. Snowflake connection not opened. |
+| Cache MISS, Snowflake succeeds | Snowflake result written to cache; values merged into rows. |
+| Cache MISS, Snowflake fails | `WARNING` logged; all rows returned with `course_progress = null`. Graceful degradation unchanged. |
+| Cache read/write fails | Log warning; fall through to direct Snowflake call. Never raise to the caller. |
+| Cache contains stale data | Maximum staleness is bounded by TTL (5 min). Upstream data is itself ~daily; 5-min cache lag is imperceptible in practice. |
+
+#### Observability and rollout
+
+- **Metrics/log counters:** cache hit, miss, set, set-failure, Snowflake-fallback — log at `INFO` level including enterprise UUID and row count. Never log the payload itself.
+#### Why not cache the full view response?
+
+For completeness: the prior `TieredCache` regression on `EnterpriseLearnerEnrollmentViewSet` returned the same response regardless of filter parameters because the cache key did not incorporate query params.This design deliberately does not reintroduce response-level caching. The enrichment map is the only safe artifact to cache here because its correctness does not depend on request-level parameters.
+
 ---
 
 ## 6. Query Frequency Explained
@@ -386,7 +476,7 @@ The current implementation queries Snowflake on every LPR API request to ensure 
 | Admin Portal CSV export | Once per `ENROLLMENTS_PAGE_SIZE` rows streamed |
 | API integrations / automated tooling | Depends on the polling interval of the client |
 
-**Planned improvement — [ENT0-9531](https://2u-internal.atlassian.net/browse/ENT0-9531):** We have already identified and scoped a caching layer to sit in front of the Snowflake call. Since `COURSE_PROGRESS` data refreshes only ~daily, a short-lived cache keyed per enterprise will eliminate redundant queries within the same refresh window, significantly reducing observed query volume while keeping the data as fresh as the underlying pipeline allows. The implementation for this task is [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788).
+**Planned improvement — [ENT-9531](https://2u-internal.atlassian.net/browse/ENT-9531):** We have already identified and scoped a caching layer to sit in front of the Snowflake call. To avoid stale data while still eliminating redundant reads, the proposed implementation uses a **5-minute per-enterprise cache window**. That should significantly reduce repeated request-time queries caused by pagination, refreshes, and repeated report views, while keeping the data close to current Snowflake state. The implementation subtask for this work is [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788).
 
 ---
 
@@ -401,7 +491,7 @@ If the Snowflake call fails for any reason — wrong credentials, network timeou
 This design means:
 - Any future auth or connectivity change (including the key pair migration) can be deployed and validated in staging without risking the production LPR API.
 - Any Snowflake outage has a bounded, predictable impact — `course_progress` degrades to `null` for the duration, nothing else breaks.
-- The caching improvement ([ENT0-9531](https://2u-internal.atlassian.net/browse/ENT0-9531)), now being implemented in [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788), can be introduced safely because the fallback path already exists.
+- The caching improvement ([ENT-9531](https://2u-internal.atlassian.net/browse/ENT-9531)), now being implemented in [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788), can be introduced safely because the fallback path already exists.
 
 ---
 
@@ -414,7 +504,7 @@ This design means:
 | **Is this flow still needed?** | Yes. It powers the `course_progress` field in the LPR — a top customer request. Disabling it would regress the feature to `null` for all enterprises. |
 | **Is this a reverse ETL?** | No. The application is strictly read-only. It SELECTs one column (`COURSE_PROGRESS`) and never writes back. |
 | **Who requests these reports?** | Enterprise admin users (employees of enterprise customers) using the Admin Portal. Each page load or CSV export triggers a Snowflake query. |
-| **Why so frequently?** | Each page load and CSV export triggers a request-time Snowflake read so admins see the freshest value currently published by Data Platform. We have already scoped a caching layer ([ENT0-9531](https://2u-internal.atlassian.net/browse/ENT0-9531)); the implementation work is now tracked in [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788), which should eliminate redundant reads within each ~daily refresh window and materially reduce query volume. |
+| **Why so frequently?** | Each page load and CSV export triggers a request-time Snowflake read so admins see the freshest value currently published by Data Platform. We have already scoped a caching layer ([ENT-9531](https://2u-internal.atlassian.net/browse/ENT-9531)); the implementation work is now tracked in [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788), which should eliminate redundant reads within each ~daily refresh window and materially reduce query volume. |
 | **Who would do the key pair migration?** | The Lakshy team (this repo). The code change is straightforward — swap `password` for `private_key` in the connector call. The prerequisite is for the Snowflake team to generate the RSA key pair and register the public key against `ENTERPRISE_SERVICE_USER`.It will be implemented in the ticket [ENT-11804](https://2u-internal.atlassian.net/browse/ENT-11804) |
 
 
