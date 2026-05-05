@@ -92,7 +92,7 @@ The batch pipeline (dbt → S3 → Aurora) is designed for throughput and operat
 >
 > *"We can defend a data lag as long as the data provenance is good."* — NR (Product)
 
-### Attempt 1 (circa 2022) — Calculate it in the Warehouse
+### Attempt 1 (around 2022) — Calculate it in the Warehouse
 
 Ticket [ENT-5795](https://2u-internal.atlassian.net/browse/ENT-5795) attempted to derive the progress percentage from block-level completion data already available in Snowflake. The problem was that `course_progress` is not a raw source field — it is a **computed LMS metric**. The LMS applies its own rules for block weighting, exclusions, visibility, and course structure before producing the learner-visible percentage. Re-implementing that logic in dbt SQL produced values that did not consistently match what learners saw in-course. Even small discrepancies (~1–2%) are expensive here because enterprise admins compare the report directly with learner screenshots and learner-reported values. That made this option operationally unsafe.
 
