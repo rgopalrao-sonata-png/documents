@@ -46,7 +46,7 @@ A discovery effort was carried out (tracked in **[ENT-9207](https://2u-internal.
 
 1. Can we replicate the Completion API representation of course progress that learners see in the LMS?
 2. Can we call the API directly that generates the progress visualization, so we stay in sync with the numbers learners see?
-3. If not, can we calculate it from Completion API data and match the results? (Harder — even minor errors would cause headaches.)
+3. If not, can we calculate it from Completion API data and match the results? (Harder — even minor errors would cause issues.)
 4. If none of the above, can we document what architectural work would be required to become consumers of that API?
 
 Two approaches were explored:
