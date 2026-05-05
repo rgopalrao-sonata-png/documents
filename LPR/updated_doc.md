@@ -433,6 +433,6 @@ This design means:
 | **Is this a reverse ETL?** | No. The application is strictly read-only. It SELECTs one column (`COURSE_PROGRESS`) and never writes back. |
 | **Who requests these reports?** | Enterprise admin users (employees of enterprise customers) using the Admin Portal. Each page load or CSV export triggers a Snowflake query. |
 | **Why so frequently?** | Each page load and CSV export triggers a request-time Snowflake read so admins see the freshest value currently published by Data Platform. We have already scoped a caching layer ([ENT0-9531](https://2u-internal.atlassian.net/browse/ENT0-9531)); the implementation work is now tracked in [ENT-11788](https://2u-internal.atlassian.net/browse/ENT-11788), which should eliminate redundant reads within each ~daily refresh window and materially reduce query volume. |
-| **Who would do the key pair migration?** | The Lakshy team (this repo). The code change is straightforward — swap `password` for `private_key` in the connector call. The prerequisite is for the Snowflake team to generate the RSA key pair and register the public key against `ENTERPRISE_SERVICE_USER`. |
+| **Who would do the key pair migration?** | The Lakshy team (this repo). The code change is straightforward — swap `password` for `private_key` in the connector call. The prerequisite is for the Snowflake team to generate the RSA key pair and register the public key against `ENTERPRISE_SERVICE_USER`.It will be implemented in the ticket [ENT-11804](https://2u-internal.atlassian.net/browse/ENT-11804) |
 
 
