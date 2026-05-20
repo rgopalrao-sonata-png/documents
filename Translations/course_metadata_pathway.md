@@ -26,24 +26,9 @@ Key references
 Diagram — data & translation flow
 ---------------------------------
 Mermaid flowchart illustrating where translations are missing (Pathway):
+<img width="900" height="240" alt="image" src="https://github.com/user-attachments/assets/2be605fb-6374-4541-aad0-0df2f1402eda" />
 
-```mermaid
-flowchart LR
-  DB[Discovery DB<br/>course_metadata_pathway (EN only)]
-  API[Discovery API<br/>/api/pathways to JSON (no PathwayTranslation)]
-  CACHE[LMS cache<br/>cache key: pathway-id (EN JSON)]
-  DASH[Dashboard API / Client<br/>/api/dashboard/v0/programs/progress_details]
-  GAP(("Translation gap<br/>No PathwayTranslation model; responses are English-only"))
 
-  DB --> API
-  API --> CACHE
-  CACHE --> DASH
-  API --> GAP
-  GAP --> DASH
-
-  classDef gapStyle fill:#fff3cd,stroke:#856404;
-  class GAP gapStyle
-```
 
 Implications
 ------------
