@@ -30,9 +30,9 @@ Mermaid flowchart illustrating where translations are missing (Pathway):
 ```mermaid
 flowchart LR
   DB[Discovery DB<br/>course_metadata_pathway (EN only)]
-  API[Discovery API<br/>/api/pathways/ → JSON (no PathwayTranslation)]
-  CACHE[LMS cache<br/>cache key: pathway-{id} (EN JSON)]
-  DASH[Dashboard API / Client<br/>/api/dashboard/v0/programs/{uuid}/progress_details/]
+  API[Discovery API<br/>/api/pathways to JSON (no PathwayTranslation)]
+  CACHE[LMS cache<br/>cache key: pathway-id (EN JSON)]
+  DASH[Dashboard API / Client<br/>/api/dashboard/v0/programs/progress_details]
   GAP(("Translation gap<br/>No PathwayTranslation model; responses are English-only"))
 
   DB --> API
