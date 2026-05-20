@@ -25,51 +25,25 @@ Key references
 
 Diagram — data & translation flow
 ---------------------------------
-Inline SVG flow diagram illustrating where translations are missing (Pathway):
+Mermaid flowchart illustrating where translations are missing (Pathway):
 
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="240" viewBox="0 0 900 240">
-  <style>
-    .box { fill:#f8f9fb; stroke:#34495e; stroke-width:1; }
-    .label { font:14px sans-serif; fill:#111827; }
-    .small { font:12px sans-serif; fill:#334155; }
-    .arrow { stroke:#34495e; stroke-width:2; marker-end:url(#arrowhead); }
-  </style>
-  <defs>
-    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
-      <polygon points="0 0, 10 3.5, 0 7" fill="#34495e" />
-    </marker>
-  </defs>
+```mermaid
+flowchart LR
+  DB[Discovery DB\ncourse_metadata_pathway (EN only)]
+  API[Discovery API\n/api/pathways/ → JSON (no PathwayTranslation)]
+  CACHE[LMS cache\ncache key: pathway-{id} (EN JSON)]
+  DASH[Dashboard API / Client\n/api/dashboard/v0/programs/{uuid}/progress_details/]
+  GAP(("Translation gap\nNo PathwayTranslation model; responses are English-only"))
 
-  <!-- Discovery DB -->
-  <rect x="20" y="30" width="200" height="70" rx="6" class="box" />
-  <text x="30" y="55" class="label">Discovery DB</text>
-  <text x="30" y="75" class="small">course_metadata_pathway (EN only)</text>
+  DB --> API
+  API --> CACHE
+  CACHE --> DASH
+  API --> GAP
+  GAP --> DASH
 
-  <!-- Discovery API -->
-  <rect x="260" y="20" width="220" height="90" rx="6" class="box" />
-  <text x="275" y="48" class="label">Discovery API</text>
-  <text x="275" y="68" class="small">/api/pathways/ → JSON (no PathwayTranslation)</text>
-
-  <!-- LMS cache -->
-  <rect x="520" y="20" width="240" height="90" rx="6" class="box" />
-  <text x="540" y="48" class="label">LMS cache</text>
-  <text x="540" y="68" class="small">cache key: pathway-{id} (EN JSON)</text>
-
-  <!-- Dashboard API & Client -->
-  <rect x="260" y="140" width="320" height="70" rx="6" class="box" />
-  <text x="275" y="165" class="label">Dashboard API / Client</text>
-  <text x="275" y="185" class="small">/api/dashboard/v0/programs/{uuid}/progress_details/</text>
-
-  <!-- arrows -->
-  <line x1="220" y1="65" x2="260" y2="65" class="arrow" />
-  <line x1="480" y1="65" x2="520" y2="65" class="arrow" />
-  <line x1="395" y1="110" x2="395" y2="140" class="arrow" />
-
-  <!-- note about translation gaps -->
-  <rect x="560" y="130" width="300" height="70" rx="6" fill="#fff3cd" stroke="#856404" />
-  <text x="575" y="155" class="label" fill="#856404">Translation gap</text>
-  <text x="575" y="175" class="small" fill="#856404">No PathwayTranslation model; responses are English-only</text>
-</svg>
+  classDef gapStyle fill:#fff3cd,stroke:#856404;
+  class GAP gapStyle
+```
 
 Implications
 ------------
