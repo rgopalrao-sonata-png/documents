@@ -197,10 +197,10 @@ if cm:
 flowchart LR
     A[Start populate_spanish_translations] --> B{--missing-only?}
     B -- No --> C[Standard queryset]
-    B -- Yes --> D[Exclude translations__language_code=es]
-    C --> E[Translate and upsert]
+    B -- Yes --> D[Exclude translations with language_code='es']
+    C --> E[Translate and upsert rows]
     D --> E
-    E --> F[ContentTranslation(es) updated]
+    E --> F[Update ContentTranslation(es)]
 ```
 
 ---
