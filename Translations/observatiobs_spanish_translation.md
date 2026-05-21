@@ -200,7 +200,7 @@ flowchart LR
     B -- Yes --> D[Exclude translations with language_code='es']
     C --> E[Translate and upsert rows]
     D --> E
-    E --> F[Update ContentTranslation(es)]
+    E --> F[Update ContentTranslation es]
 ```
 
 ---
