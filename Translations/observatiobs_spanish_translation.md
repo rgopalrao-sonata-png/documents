@@ -1,504 +1,263 @@
-# ContentMetadata, Spanish Translation, and Algolia Indexing Flow
 
-## Purpose
+# Algolia Translation Investigation Guide
 
-This document explains, end-to-end, how enterprise-catalog:
+## Observation from current Algolia response (Marketing Digital)
 
-1. loads `ContentMetadata` from Discovery,
-2. enriches it with full course/program payloads,
-3. stores Spanish translations in `ContentTranslation`,
-4. creates Algolia objects,
-5. creates Spanish Algolia variants,
-6. fails when Spanish conversion is missing or incomplete,
-7. can be backfilled for all missing Spanish translations.
+- The sample record below is the **English variant**, not Spanish:
+  - `objectID = program-53005fd8-f03a-4484-bc49-7e8054a9fee8-customer-uuids-9`
+  - `metadata_language = en`
+  - `title = Digital Marketing`
+- This confirms translation is not being validated yet; you must explicitly find the `-es` record.
+- Expected Spanish object pattern for the same shard:
+  - `program-53005fd8-f03a-4484-bc49-7e8054a9fee8-es-customer-uuids-9`
 
-This is intended as an operator/developer runbook.
+## Important: Snowflake vs service DB
 
----
-
-## Executive summary
-
-- `ContentMetadata` is loaded from Discovery `search/all` results.
-- For courses and programs, later jobs enrich the minimal `search/all` payload with full `/courses/` and `/programs/` payloads.
-- `ContentTranslation` is **not** populated during content sync.
-- Spanish translations are populated separately by the management command `populate_spanish_translations`.
-- Algolia indexing always creates the English object from `ContentMetadata.json_metadata`.
-- A Spanish Algolia object is created **only** when a matching `ContentTranslation(language_code='es')` row exists.
-- If Spanish translation fails, the most common root cause is: **missing `ContentTranslation` row for `language_code='es'`**.
+- `ContentMetadata` and `ContentTranslation` are application tables in the enterprise-catalog service DB (PostgreSQL), not Snowflake source-of-truth tables.
+- If you do not see `catalog_contentmetadata` or `catalog_contenttranslation` in Snowflake, that is expected in many environments.
+- Verification should be done via:
+  1. Django ORM (`manage.py shell`) in enterprise-catalog, or
+  2. Postgres SQL against enterprise-catalog database.
 
 ---
 
-## Main data models
+## Exact DB queries to verify `ContentTranslation`
 
-### `ContentMetadata`
+## 1) SQL query: verify translation rows for one program UUID/content key and child courses
 
-Stores content payload from Discovery.
+Use this in psql (replace values as needed):
 
-Key fields:
+```sql
+-- 1) Find the program ContentMetadata row
+SELECT id, content_key, content_type, content_uuid, json_metadata
+FROM catalog_contentmetadata
+WHERE content_type = 'program'
+  AND (content_key = '53005fd8-f03a-4484-bc49-7e8054a9fee8' OR content_uuid::text = '53005fd8-f03a-4484-bc49-7e8054a9fee8');
 
-- `content_key`
-- `content_uuid`
-- `content_type`
-- `parent_content_key`
-- `_json_metadata` / `json_metadata`
+-- 2) Verify Spanish translation row for that program
+SELECT ct.id, ct.content_metadata_id, cm.content_key, ct.language_code,
+       ct.title, ct.short_description, ct.full_description, ct.subtitle,
+       ct.source_hash, ct.created, ct.modified
+FROM catalog_contenttranslation ct
+JOIN catalog_contentmetadata cm ON cm.id = ct.content_metadata_id
+WHERE ct.language_code = 'es'
+  AND (cm.content_key = '53005fd8-f03a-4484-bc49-7e8054a9fee8' OR cm.content_uuid::text = '53005fd8-f03a-4484-bc49-7e8054a9fee8');
 
-Primary reference:
-
-- `enterprise_catalog/apps/catalog/models.py`
-
-### `ContentTranslation`
-
-Stores precomputed translated text for a `ContentMetadata` row.
-
-Key fields:
-
-- `content_metadata`
-- `language_code`
-- `title`
-- `short_description`
-- `full_description`
-- `subtitle`
-- `source_hash`
-
-Important: this table stores **translated text fields only**. It does **not** store structural fields such as:
-
-- `course_keys`
-- `program_type`
-- `partners`
-- `subjects`
-- `prices`
-- `availability`
-
-Primary reference:
-
-- `enterprise_catalog/apps/catalog/models.py`
-
----
-
-## High-level architecture
-
-```mermaid
-flowchart TD
-	A[Discovery search/all] --> B[update_contentmetadata_from_discovery]
-	B --> C[create_content_metadata]
-	C --> D[(catalog_contentmetadata)]
-
-	D --> E[update_full_content_metadata_task]
-	E --> F[Discovery /courses/ and /programs/]
-	F --> D
-
-	D --> G[populate_spanish_translations]
-	G --> H[Xpert AI translation call]
-	H --> I[(catalog_contenttranslation)]
-
-	D --> J[reindex_algolia / index_enterprise_catalog_in_algolia_task]
-	I --> J
-	J --> K[English Algolia object]
-	J --> L[Spanish Algolia object if es translation exists]
-	K --> M[Algolia index]
-	L --> M
+-- 3) Verify child course translations used by nested program.course_details
+-- (if you know course keys from program json)
+SELECT cm.content_key, ct.language_code, ct.title, ct.short_description, ct.source_hash
+FROM catalog_contenttranslation ct
+JOIN catalog_contentmetadata cm ON cm.id = ct.content_metadata_id
+WHERE ct.language_code = 'es'
+  AND cm.content_key IN (
+    'USMx+DM01',
+    'USMx+DM02',
+    'USMx+DM03',
+    'USMx+DM04'
+  )
+ORDER BY cm.content_key;
 ```
 
----
-
-## Step 1: How `ContentMetadata` gets loaded
-
-### Entry point
-
-`update_contentmetadata_from_discovery(catalog_query, dry_run=False)`
-
-What it does:
-
-1. Fetches content from Discovery via `CatalogQueryMetadata(catalog_query).metadata`
-2. Uses Discovery `search/all` results
-3. Creates or updates `ContentMetadata`
-4. Associates returned content rows to the `CatalogQuery`
-
-Relevant code path:
-
-- `enterprise_catalog/apps/catalog/models.py`
-  - `update_contentmetadata_from_discovery()`
-  - `associate_content_metadata_with_query()`
-  - `create_content_metadata()`
-
-### Discovery API path used
-
-Discovery client method:
-
-- `DiscoveryApiClient.get_metadata_by_query()`
-
-Behavior:
-
-- calls Discovery `search/all`
-- includes `exclude_expired_course_run=True`
-- includes `include_learner_pathways=True`
-
-This is the source of the initial content payload.
-
-### What gets stored initially
-
-`ContentMetadata` is seeded from the Discovery response using `_get_defaults_from_metadata()`.
-
-Important behavior:
-
-- **new records**: full entry goes into `_json_metadata`
-- **existing non-course records** (programs, pathways, course runs): `_json_metadata` is overwritten from the latest `search/all` entry
-- **existing course records**: only selected `search/all` fields are merged into existing full course metadata, to preserve richer `/courses/` data already stored later
-
-### Create/update behavior
-
-`create_content_metadata()`:
-
-- filters unsupported content
-- batches the update/create operation
-- updates existing records through `_execute_updates_existing_records_avoid_deadlock()`
-- creates new rows through `_create_new_content_metadata()`
-
-### Association to catalogs
-
-After content rows exist, `associate_content_metadata_with_query()` does:
-
-- `catalog_query.contentmetadata_set.set(metadata_list, clear=True)`
-
-So the `CatalogQuery` owns the association to the content set.
-
----
-
-## Step 2: How full course/program metadata is loaded
-
-The initial `search/all` payload is not the final shape used for indexing.
-
-### Enrichment job
-
-`update_full_content_metadata_task()`
-
-This job:
-
-- loads all course keys from `ContentMetadata`
-- calls Discovery `/courses/`
-- loads all program keys from `ContentMetadata`
-- calls Discovery `/programs/`
-- merges full payloads into `ContentMetadata.json_metadata`
-
-Why this matters:
-
-- `search/all` gives the initial content universe
-- `/courses/` and `/programs/` provide richer data needed by APIs and Algolia
-
-### Program relationships
-
-When full course metadata is loaded, associated programs embedded in course payloads are also created/updated through:
-
-- `create_course_associated_programs(programs, course_content_metadata)`
-
-This means a program can exist in `ContentMetadata` because:
-
-1. it came directly from `search/all`, or
-2. it was created via associated course program data.
-
----
-
-## Step 3: Who adds rows into `ContentTranslation`
-
-### Short answer
-
-`ContentTranslation` is populated by the management command:
-
-- `populate_spanish_translations`
-
-It is **not** populated by:
-
-- `update_contentmetadata_from_discovery`
-- `update_full_content_metadata_task`
-- `reindex_algolia`
-- `index_enterprise_catalog_in_algolia_task`
-
-### Actual owner of translation writes
-
-Management command:
-
-- `enterprise_catalog/apps/catalog/management/commands/populate_spanish_translations.py`
-
-This command:
-
-1. iterates through `ContentMetadata`
-2. checks whether the item should be translated
-3. computes a `source_hash`
-4. creates or updates `ContentTranslation(language_code='es')`
-5. saves translated `title`, `short_description`, `full_description`, `subtitle`
-
-### Translation engine used
-
-`translate_to_spanish()` in:
-
-- `enterprise_catalog/apps/catalog/translation_utils.py`
-
-This calls:
-
-- `chat_completion()` from the Xpert AI client
-
-So Spanish translation depends on an external AI translation call.
-
-### Change detection
-
-The command computes a `source_hash` from these fields:
-
-- `title`
-- `short_description`
-- `full_description`
-- `subtitle`
-
-If the hash has not changed and `--force` is not used, translation is skipped.
-
-This prevents repeated re-translation of unchanged content.
-
----
-
-## Step 4: How Algolia objects are created
-
-### Main indexing task
-
-Algolia indexing is driven by:
-
-- `index_enterprise_catalog_in_algolia_task()`
-
-which eventually calls:
-
-- `_reindex_algolia()`
-- `_index_content_keys_in_algolia()`
-- `_get_algolia_products_for_batch()`
-- `add_metadata_to_algolia_objects()`
-
-### English object creation
-
-For each `ContentMetadata`, `add_metadata_to_algolia_objects()` starts from:
-
-- `metadata.json_metadata`
-
-Then it adds:
-
-- `objectID`
-- `metadata_language='en'`
-- enterprise catalog UUID shards
-- enterprise customer UUID shards
-- academy UUIDs/tags
-- video IDs
-
-Then `_algolia_object_from_product()` derives the final Algolia fields.
-
-### Program object derivation
-
-For programs, `_algolia_object_from_product()` builds fields such as:
-
-- `course_keys`
-- `programs`
-- `program_titles`
-- `program_type`
-- `availability`
-- `partners`
-- `subjects`
-- `skill_names`
-- `level_type`
-- `learning_items`
-- `prices`
-- `banner_image_url`
-- `course_details`
-- `learning_type`
-- `learning_type_v2`
-- `metadata_language`
-
-Important:
-
-- `course_keys` come from `ContentMetadata.json_metadata`, not from `ContentTranslation`
-- this is why a program Algolia object can exist even when there is no translation row
-
-### Why English objects always exist
-
-English indexing uses the `ContentMetadata` row directly.
-
-So if `ContentMetadata` exists and the item is indexable, the English Algolia object is created regardless of whether `ContentTranslation` exists.
-
----
-
-## Step 5: How Spanish Algolia conversion happens
-
-### Spanish object creation logic
-
-Spanish variants are created by:
-
-- `create_spanish_algolia_object(algolia_object, content_metadata)`
-
-Behavior:
-
-1. deep-copies the English Algolia object
-2. looks up `content_metadata.translations.get(language_code='es')`
-3. if found, overrides translated text fields
-4. changes `objectID` to append `-es`
-5. sets `metadata_language='es'`
-6. returns the Spanish object
-
-If no translation row exists, it returns `None`.
-
-### Fields actually translated in Spanish object
-
-Currently the Spanish Algolia conversion overrides only these fields if present:
-
-- `title`
-- `short_description`
-- `full_description`
-- `subtitle`
-
-Not everything is translated during this step.
-
-Examples of fields that remain sourced from the original English metadata pipeline:
-
-- `course_keys`
-- `program_type`
-- `availability`
-- `prices`
-- `partners`
-- `language`
-- `learning_items`
-- `subjects`
-- `skill_names`
-
-That is expected given the current implementation.
-
----
-
-## Detailed sequence diagram
-
-```mermaid
-sequenceDiagram
-	participant CQ as CatalogQuery
-	participant DISC as Discovery
-	participant CM as ContentMetadata
-	participant CT as ContentTranslation
-	participant XAI as Xpert AI
-	participant IDX as Algolia Indexer
-	participant ALG as Algolia
-
-	CQ->>DISC: search/all query
-	DISC-->>CQ: content results
-	CQ->>CM: create/update ContentMetadata
-
-	Note over CM: Initial metadata loaded
-
-	CM->>DISC: /courses/ and /programs/
-	DISC-->>CM: full metadata payloads
-	CM->>CM: merge into json_metadata
-
-	CM->>XAI: translate translatable fields to Spanish
-	XAI-->>CM: translated text
-	CM->>CT: create/update language_code='es'
-
-	IDX->>CM: read json_metadata
-	IDX->>IDX: build English Algolia object
-	IDX->>CT: lookup es translation by content_metadata
-
-	alt es translation exists
-		IDX->>IDX: create Spanish object (objectID + -es, metadata_language=es)
-		IDX->>ALG: push EN + ES objects
-	else no es translation
-		IDX->>ALG: push EN object only
-	end
-```
-
----
-
-## Why Spanish conversion fails
-
-## Primary root cause
-
-### Missing `ContentTranslation(language_code='es')`
-
-This is the most likely and most common root cause.
-
-If no row exists, this code path occurs:
-
-1. English object is created from `ContentMetadata`
-2. `create_spanish_algolia_object()` looks up `translations.get(language_code='es')`
-3. lookup fails
-4. function returns `None`
-5. no Spanish Algolia object is indexed
-
-Result:
-
-- object exists in Algolia only with `metadata_language='en'`
-- no corresponding `-es` object exists
-
-## Other failure modes
-
-### 1. Translation command skipped the content
-
-`populate_spanish_translations` skips content when:
-
-- item is not eligible for Algolia indexing, unless `--all` is used
-- course advertised run is archived
-- source hash has not changed and `--force` is not used
-
-### 2. Translation API failure
-
-If Xpert AI translation fails:
-
-- HTTP error
-- unexpected exception
-- empty response
-
-then translated fields may be blank or row creation may not happen as expected.
-
-### 3. Translation exists but Algolia was not reindexed yet
-
-If `ContentTranslation` was created after the last Algolia rebuild:
-
-- DB has Spanish translation
-- Algolia still has only English object
-
-This requires a reindex.
-
-### 4. Content exists but is not indexable
-
-The program/course may exist in `ContentMetadata` but fail the indexability checks.
-
-For programs, indexability is based on conditions such as:
-
-- marketing URL exists
-- type exists
-- not hidden
-- status is active
-
-### 5. Partial Spanish conversion
-
-Even when Spanish object exists, only the supported translated fields are overridden.
-
-So some fields may still appear effectively English because they are not part of `ContentTranslation`-based override logic.
-
----
-
-## How to check whether Spanish is missing
-
-## ORM check for one content key
+## 2) Django shell queries (exact)
 
 ```python
 from enterprise_catalog.apps.catalog.models import ContentMetadata, ContentTranslation
 
-content_key = 'a17b8a86-6bfe-4b83-b42b-7c46843b3250'
+program_key = '53005fd8-f03a-4484-bc49-7e8054a9fee8'
 
-cm = ContentMetadata.objects.filter(content_key=content_key).first()
-print('content exists:', bool(cm))
+program = ContentMetadata.objects.filter(content_key=program_key).first()
+print('program exists:', bool(program))
+if program:
+    es = ContentTranslation.objects.filter(content_metadata=program, language_code='es').first()
+    print('program es translation exists:', bool(es))
+    if es:
+        print('title:', es.title)
+        print('short_description:', (es.short_description or '')[:160])
+        print('full_description:', (es.full_description or '')[:160])
+        print('subtitle:', es.subtitle)
+        print('source_hash:', es.source_hash)
 
-if cm:
-	es = ContentTranslation.objects.filter(content_metadata=cm, language_code='es').first()
-	print('has es translation:', bool(es))
-	if es:
-		print(es.title)
-		print(es.short_description)
+    course_keys = [c.get('key') for c in (program.json_metadata.get('courses') or []) if c.get('key')]
+    print('course_keys in program:', course_keys)
+
+    rows = ContentTranslation.objects.filter(
+        content_metadata__content_key__in=course_keys,
+        language_code='es',
+    ).values('content_metadata__content_key', 'title', 'short_description')
+    print('child course es translations count:', len(rows))
+    for row in rows:
+        print(row)
 ```
 
-## SQL check for missing Spanish translations
+---
+
+## Code change implemented (nested program field translation)
+
+Implemented in:
+- [enterprise_catalog/apps/catalog/algolia_utils.py](enterprise_catalog/apps/catalog/algolia_utils.py)
+
+Behavior now:
+1. For Spanish program objects, set `program_titles` to translated program `title`.
+2. For program `course_details`, look up pre-computed `ContentTranslation(language_code='es')` by child course `content_key`.
+3. Replace nested `course_details[].title` and `course_details[].short_description` where translation rows exist.
+4. Keep English fallback for child courses with no translation row.
+
+Test added in:
+- [enterprise_catalog/apps/catalog/tests/test_algolia_translation.py](enterprise_catalog/apps/catalog/tests/test_algolia_translation.py)
+
+---
+
+## How to check in Algolia if translation happened
+
+## A) In Algolia Dashboard
+
+1. Open the active enterprise-catalog index.
+2. Search by object id prefix or UUID:
+   - `program-53005fd8-f03a-4484-bc49-7e8054a9fee8`
+3. Confirm there are 2 object variants:
+   - English object (no `-es` suffix)
+   - Spanish object (`objectID` contains `-es`)
+4. For your exact shard, search this specific object id:
+  - `program-53005fd8-f03a-4484-bc49-7e8054a9fee8-es-customer-uuids-9`
+5. If it does not exist, Spanish indexing for this customer-uuid shard has not been produced.
+6. Open Spanish object and verify:
+   - `metadata_language` is `es`
+   - `title` is Spanish
+   - `program_titles[0]` is Spanish
+   - `course_details[*].title` and `course_details[*].short_description` are Spanish where DB translation rows exist
+
+## B) Query-level check using current API pattern
+
+Your API request should include/return filters with:
+- `filters=... AND metadata_language:es`
+
+Then in hits verify:
+- `objectID` contains `-es`
+- `metadata_language = es`
+- translated fields are present
+
+---
+
+## If mismatch still happens
+
+1. If DB rows are missing in `catalog_contenttranslation`:
+   - Run translation command for target content:
+   - `./manage.py populate_spanish_translations --content-keys <content_key> --force`
+2. Reindex Algolia:
+   - `./manage.py reindex_algolia --force --no-async`
+3. Recheck object in Algolia dashboard/API.
+4. If DB and Algolia are correct but UI still shows English, inspect frontend query/filter and hit-selection logic.
+
+---
+
+## Your scenario runbook (Program/Course exists in ContentMetadata, missing in ContentTranslation)
+
+Use this section when:
+
+- English Algolia object exists
+- `catalog_contentmetadata` has the record
+- `catalog_contenttranslation` has no `language_code='es'` row
+
+### What it means
+
+This is usually **not a raw data integrity bug** in `catalog_contentmetadata`. It means translation materialization did not occur (or was skipped) for that content.
+
+English indexing reads from `ContentMetadata`; Spanish indexing is conditional on `ContentTranslation(es)`.
+
+### Is this a data issue?
+
+Short answer: **sometimes, but often operational/processing rather than source-data corruption**.
+
+Interpretation by state:
+
+1. `ContentMetadata` present, `ContentTranslation(es)` missing
+  - Most common cause: translation pipeline skipped/failed/not yet run for this key.
+  - Usually an operational gap, not a broken metadata row.
+
+2. `ContentMetadata` present, `ContentTranslation(es)` present but empty fields
+  - Translation API returned empty/failed, or source text fields were empty.
+  - Data quality issue can exist if source fields are blank.
+
+3. Both present and populated, but no `-es` Algolia object
+  - Reindex not run after translation, wrong environment/index, or stale Algolia object view.
+
+### Why translation may be missing even when metadata exists
+
+Possible causes (in order of frequency):
+
+1. `populate_spanish_translations` did not run after content was added.
+2. Command ran but skipped item due to indexability checks (unless `--all` used).
+3. Command ran before full metadata refresh; translatable fields missing at translation time.
+4. Translation provider call failed for that item.
+5. Existing row considered up-to-date via `source_hash` and not forced.
+6. You are checking DB from one environment and Algolia index from another.
+
+### Expert verification steps (exact order)
+
+1. Confirm environment alignment
+  - Same deployment for DB + `ALGOLIA_APPLICATION_ID` + `ALGOLIA_INDEX_NAME`.
+
+2. Confirm content exists in metadata
 
 ```sql
-SELECT cm.id, cm.content_key, cm.content_type
+SELECT id, content_key, content_type, content_uuid
+FROM catalog_contentmetadata
+WHERE content_key = '<content_key>';
+```
+
+3. Confirm Spanish translation row is missing/present
+
+```sql
+SELECT ct.id, cm.content_key, ct.language_code, ct.title, ct.short_description, ct.full_description, ct.subtitle
+FROM catalog_contenttranslation ct
+JOIN catalog_contentmetadata cm ON cm.id = ct.content_metadata_id
+WHERE cm.content_key = '<content_key>'
+  AND ct.language_code = 'es';
+```
+
+4. Populate translation for affected content key(s)
+
+```bash
+./manage.py populate_spanish_translations --content-keys <content_key_1> <content_key_2> --force
+```
+
+5. Reindex Algolia after translation
+
+```bash
+./manage.py reindex_algolia --force --no-async
+```
+
+6. Validate in Algolia
+  - English object: no `-es` suffix, `metadata_language=en`
+  - Spanish object: `-es` suffix present, `metadata_language=es`
+
+### For your concrete example
+
+If the program row exists in `catalog_contentmetadata` and the child courses also exist there, but any of these are missing from `catalog_contenttranslation` for `es`, then:
+
+- English object is expected to exist.
+- Spanish object (or translated nested course details) will be partial/missing until translations are materialized.
+
+### Bulk fix for all missing Spanish translations
+
+Run a full backfill:
+
+```bash
+./manage.py update_content_metadata --force
+./manage.py update_full_content_metadata --force
+./manage.py populate_spanish_translations --all --force --batch-size 50
+./manage.py reindex_algolia --force --no-async
+```
+
+### Operational recommendation
+
+To avoid repeats:
+
+1. Ensure translation cron completes successfully before/near reindex window.
+2. Monitor count of missing `es` translations:
+
+```sql
+SELECT COUNT(*) AS missing_es
 FROM catalog_contentmetadata cm
 LEFT JOIN catalog_contenttranslation ct
   ON ct.content_metadata_id = cm.id
@@ -506,217 +265,159 @@ LEFT JOIN catalog_contenttranslation ct
 WHERE ct.id IS NULL;
 ```
 
-## SQL check for only indexable programs/courses missing Spanish
-
-This cannot be expressed perfectly in one generic query because part of the indexability logic is implemented in Python, but the SQL above gives the base missing set.
+3. Alert on translation API failures in service logs.
 
 ---
 
-## How to update `ContentTranslation` for all missing Spanish translations
+## Incident template (copy/paste)
 
-## Recommended approach
+Use this template for Jira, incident notes, or handoff.
 
-Use the existing management command.
+```markdown
+Title: Spanish Algolia object missing for <content_key>
 
-### Translate all eligible missing/changed content
+Summary
+- English Algolia object exists for `<content_key>`.
+- Spanish object (`-es` suffix / `metadata_language=es`) is missing.
 
-```bash
-./manage.py populate_spanish_translations --batch-size 50
+Impact
+- Learners searching in Spanish receive English content for this item.
+- Program/course field localization is incomplete in Algolia results.
+
+Scope
+- Content key(s): <content_key_1>, <content_key_2>
+- Content type(s): <course|program>
+- Environment: <prod|stage>
+- Algolia index: <index_name>
+
+Root cause
+- `catalog_contentmetadata` row exists, but `catalog_contenttranslation` row with `language_code='es'` is missing (or stale/empty).
+- Spanish Algolia object creation is conditional on that translation row.
+
+Evidence
+- DB check: `catalog_contentmetadata` contains key `<content_key>`.
+- DB check: no row in `catalog_contenttranslation` for `<content_key>` + `language_code='es'`.
+- Algolia check: English object exists; no matching `-es` object.
+
+Fix applied
+1. Ran translation materialization:
+  - `./manage.py populate_spanish_translations --content-keys <content_key(s)> --force`
+2. Reindexed Algolia:
+  - `./manage.py reindex_algolia --force --no-async`
+
+Validation
+- `catalog_contenttranslation` now contains `language_code='es'` row(s).
+- Algolia now contains `-es` object(s) with `metadata_language='es'`.
+- Translated fields (`title`, `short_description`, `full_description`, `subtitle`) populated as expected.
+
+Prevention
+- Ensure `populate_spanish_translations` succeeds before/near reindex window.
+- Monitor count of missing `es` rows in `catalog_contenttranslation`.
+- Alert on translation API failures and cronjob failures.
+
+Owner
+- <team/person>
+
+ETA/Status
+- <in-progress|resolved>
 ```
 
-This is the standard production path.
+---
 
-### Translate everything, even content that would normally be skipped
+## Fix implemented in code (backfill missing Spanish only)
 
-```bash
-./manage.py populate_spanish_translations --all --batch-size 50
+This repo now includes a targeted fix in:
+
+- [enterprise_catalog/apps/catalog/management/commands/populate_spanish_translations.py](enterprise_catalog/apps/catalog/management/commands/populate_spanish_translations.py)
+
+### What was the issue
+
+- We needed a safe production mode to backfill only content missing `language_code='es'`.
+- Existing command behavior was broad (translate/update many items), which is fine for full refresh but less ideal for focused backfill.
+
+### What was changed
+
+- Added a new flag: `--missing-only`
+- In this mode, command scopes queryset to content with **no** Spanish translation row:
+  - excludes rows where `translations__language_code='es'`
+- Added explicit logs for this mode:
+  - announces missing-only filter is active
+  - logs how many items are missing before processing
+
+### What was intentionally not changed
+
+- Default behavior remains unchanged when `--missing-only` is not passed.
+- Existing flags (`--all`, `--force`, `--content-keys`, `--batch-size`, `--dry-run`) continue to work the same.
+
+---
+
+## Visualization (before vs after)
+
+```mermaid
+flowchart TD
+    A[Run populate_spanish_translations] --> B{--missing-only?}
+    B -- No --> C[Original behavior\nProcess standard queryset]
+    B -- Yes --> D[New behavior\nFilter to rows missing es translation]
+    C --> E[Translate/Create/Update rows]
+    D --> E
+    E --> F[Reindex Algolia]
 ```
 
-Use this when you want to backfill everything, not only currently indexable content.
+### Missing-only internal flow
 
-### Force re-translation for all content
-
-```bash
-./manage.py populate_spanish_translations --all --force --batch-size 50
+```mermaid
+flowchart LR
+    CM[(catalog_contentmetadata)] --> Q[Query content]
+    CT[(catalog_contenttranslation)] --> Q
+    Q -->|exclude translations__language_code=es| M[Missing-only set]
+    M --> T[Translate fields]
+    T --> UPSERT[Create/Update ContentTranslation es]
+    UPSERT --> ALG[reindex_algolia]
 ```
 
-Use this when:
+---
 
-- source content changed,
-- translation prompt changed,
-- or you suspect stale/bad Spanish content.
+## How to use the fix in production
 
-### Translate only specific missing keys
+Backfill only missing Spanish translations:
 
 ```bash
-./manage.py populate_spanish_translations --content-keys <key1> <key2> <key3> --force
+./manage.py populate_spanish_translations --missing-only --all --batch-size 50
 ```
 
-Example:
-
-```bash
-./manage.py populate_spanish_translations --content-keys a17b8a86-6bfe-4b83-b42b-7c46843b3250 --force
-```
-
-## After translations are created
-
-You must rebuild Algolia to materialize Spanish objects:
+Then regenerate Algolia objects:
 
 ```bash
 ./manage.py reindex_algolia --force --no-async
 ```
 
-Without this step, the translation rows will exist in the database but not in Algolia.
-
----
-
-## Full operational backfill plan
-
-### Safe sequence
-
-1. Refresh content metadata from Discovery
-2. Refresh full course/program metadata
-3. Populate missing Spanish translations
-4. Reindex Algolia
-5. Verify `-es` objects exist
-
-### Commands
+Optional (targeted keys only):
 
 ```bash
-./manage.py update_content_metadata --force
-./manage.py update_full_content_metadata --force
-./manage.py populate_spanish_translations --batch-size 50
-./manage.py reindex_algolia --force --no-async
-```
-
-### Full backfill including skipped content
-
-```bash
-./manage.py update_content_metadata --force
-./manage.py update_full_content_metadata --force
-./manage.py populate_spanish_translations --all --force --batch-size 50
+./manage.py populate_spanish_translations --missing-only --content-keys <key1> <key2> --force
 ./manage.py reindex_algolia --force --no-async
 ```
 
 ---
 
-## Production scheduling
+## Impact assessment
 
-There is a scheduled cron job for Spanish translation population.
+### Functional impact
 
-Production/stage config includes:
+- Positive: enables safe, focused backfill for missing Spanish rows.
+- Positive: reduces unnecessary translation churn on already translated content.
 
-- daily `populate_spanish_translations --batch-size 50`
-- daily `reindex_algolia --force --no-async`
+### Risk impact
 
-Important operational nuance:
+- Low risk: change is opt-in via `--missing-only`.
+- Low risk: default command path is unchanged.
 
-- translation population and Algolia reindex are separate jobs
-- if content is created after translation job but before reindex, or after reindex but before translation, English-only windows can happen until the next cycle completes
+### Performance impact
 
----
+- In missing-only mode, fewer rows are processed in most cases.
+- Reindex workload remains unchanged and still depends on total indexable content.
 
-## Why a program can appear in Algolia even if course keys are not in `ContentTranslation`
+### Operational impact
 
-This is expected.
-
-Example:
-
-- program contains `course_keys = ["DavidsonX+DavidsonX_D008", "DavidsonX+DavidsonX.D006"]`
-
-These values are derived from program metadata in `ContentMetadata.json_metadata`.
-
-They are not supposed to be stored in `ContentTranslation`.
-
-`ContentTranslation` only stores text translations for supported fields like `title` and descriptions.
-
-So:
-
-- English program object can still be built
-- `course_keys` can still appear in Algolia
-- Spanish object still fails if the `es` translation row is missing
-
----
-
-## Troubleshooting checklist
-
-### If a Spanish Algolia object is missing
-
-Check in this order:
-
-1. `ContentMetadata` row exists
-2. `ContentTranslation(language_code='es')` row exists
-3. translation fields are populated
-4. content is indexable
-5. Algolia reindex has run after translation creation
-6. Algolia object with `-es` suffix exists
-
-### If translation row is missing
-
-Run:
-
-```bash
-./manage.py populate_spanish_translations --content-keys <content_key> --force
-./manage.py reindex_algolia --force --no-async
-```
-
-### If translation row exists but Algolia is still English-only
-
-Likely causes:
-
-- reindex has not run since translation creation
-- content was not included in indexable set
-- stale object still being inspected
-
-### If translation row exists but some fields remain English
-
-Likely cause:
-
-- those fields are not part of the current Spanish override implementation
-
----
-
-## Root cause statement template
-
-Use this wording for incident notes:
-
-> The Spanish Algolia object was not created because enterprise-catalog had no `ContentTranslation` row for the affected `ContentMetadata` with `language_code='es'`. English indexing succeeded because it relies directly on `ContentMetadata.json_metadata`, but Spanish indexing is conditional on a precomputed translation row and therefore was skipped.
-
----
-
-## Recommended remediation
-
-For one-off fixes:
-
-```bash
-./manage.py populate_spanish_translations --content-keys <content_key> --force
-./manage.py reindex_algolia --force --no-async
-```
-
-For broad platform cleanup:
-
-```bash
-./manage.py update_content_metadata --force
-./manage.py update_full_content_metadata --force
-./manage.py populate_spanish_translations --all --force --batch-size 50
-./manage.py reindex_algolia --force --no-async
-```
-
-For ongoing prevention:
-
-- monitor missing `ContentTranslation(es)` coverage
-- alert on translation API failures
-- ensure translation cron completes before or before next reindex window
-- periodically audit Algolia for English-only high-traffic content
-
----
-
-## Key takeaways
-
-- `ContentMetadata` is the source of truth for English indexing.
-- `ContentTranslation` is the source of truth for Spanish text overrides.
-- Spanish Algolia objects are optional and conditional.
-- Missing `ContentTranslation(es)` is the main reason Spanish indexing fails.
-- `course_keys` and similar structural fields do not belong in `ContentTranslation`.
-- Backfilling missing Spanish translations requires both translation population and Algolia reindex.
-
+- Better observability for missing-translation backfill runs through mode-specific logs.
+- Fits existing runbook steps without changing downstream indexing logic.
