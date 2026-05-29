@@ -35,6 +35,79 @@ Discovery and Enterprise Catalog.
 
 ---
 
+## 0.1 Architecture Diagram
+
+```mermaid
+flowchart TD
+    subgraph AUTHORING["✍️ Course Authoring"]
+        PUB["Publisher / Studio"]
+    end
+
+    subgraph DISCOVERY["🔍 course-discovery Service"]
+        DISC_DB[("Discovery DB\nCourse, CourseRun, Program")]
+        ES[("Elasticsearch\nprod-edx-edxapp-search-002")]
+        DISC_SIGNAL["Django Signals\nreal-time on data change"]
+        DISC_MGMT["manage.py update_index\n--refresh --disable_change_limit\n3× daily via Jenkins"]
+        SEARCH_ALL["GET /api/v1/search/all/\nGET /api/v2/search/all/"]
+        COURSES_API["GET /api/v1/courses/{key}/\nGET /api/v1/programs/{uuid}/"]
+    end
+
+    subgraph ENT_CATALOG["📦 enterprise-catalog Service"]
+        CATALOG_QUERY[("CatalogQuery\ncontent_filter JSON\ne.g. id=10, id=13")]
+        CONTENT_META[("ContentMetadata\ncontent_key, json_metadata,\ncontent_type, catalog_queries M2M")]
+        ENT_CATALOG_TABLE[("EnterpriseCatalog\nuuid, enterprise_uuid,\ncatalog_query FK")]
+        SYNC_FUNC["update_contentmetadata_from_discovery()\nassociate_content_metadata_with_query()"]
+        FULL_META_TASK["update_full_content_metadata_task()\nenriches with /courses/ data"]
+        ALGOLIA_TASK["index_enterprise_catalog_in_algolia_task()"]
+        REFRESH_API["POST /api/v1/enterprise-catalog/{uuid}/refresh_metadata/"]
+        CELERY_BEAT["Celery Beat\nnightly cron"]
+    end
+
+    subgraph LMS["🏫 LMS / edx-enterprise"]
+        ENT_CUSTOMER[("EnterpriseCustomer")]
+        PROVISION["Provisioning Workflow\nenterprise-access"]
+        MAPPING["PRODUCT_ID_TO_\nCATALOG_QUERY_ID_MAPPING"]
+    end
+
+    subgraph ALGOLIA["🔎 Algolia"]
+        ALGOLIA_IDX["Algolia Search Index\nscoped by enterprise catalog UUIDs"]
+    end
+
+    subgraph LEARNER["👤 Learner"]
+        PORTAL["Learner Portal\nfrontend-app-learner-portal-enterprise"]
+    end
+
+    PUB -->|"publish/update course"| DISC_DB
+    DISC_DB --> DISC_SIGNAL
+    DISC_SIGNAL -->|"real-time re-index"| ES
+    DISC_MGMT -->|"scheduled re-index"| ES
+    ES --> SEARCH_ALL
+
+    PROVISION -->|"product_id lookup"| MAPPING
+    MAPPING -->|"catalog_query_id e.g. 10"| CATALOG_QUERY
+    PROVISION -->|"creates"| ENT_CATALOG_TABLE
+    ENT_CATALOG_TABLE -->|"FK"| CATALOG_QUERY
+    ENT_CATALOG_TABLE -->|"belongs to"| ENT_CUSTOMER
+
+    CELERY_BEAT -->|"nightly"| SYNC_FUNC
+    REFRESH_API -->|"on-demand after catalog creation"| SYNC_FUNC
+
+    CATALOG_QUERY -->|"content_filter as query params"| SYNC_FUNC
+    SYNC_FUNC -->|"GET /api/v1/search/all/?enterprise_subscription_inclusion=true"| SEARCH_ALL
+    SEARCH_ALL -->|"list of course/run/program dicts"| SYNC_FUNC
+    SYNC_FUNC -->|"get_or_create + M2M link"| CONTENT_META
+    CONTENT_META --> FULL_META_TASK
+    FULL_META_TASK -->|"GET /api/v1/courses/{key}/"| COURSES_API
+    COURSES_API -->|"merged full metadata"| FULL_META_TASK
+    FULL_META_TASK --> ALGOLIA_TASK
+    ALGOLIA_TASK -->|"push enriched json_metadata"| ALGOLIA_IDX
+
+    ALGOLIA_IDX --> PORTAL
+    PORTAL --> LEARNER
+```
+
+---
+
 ## 1. The Relationship at a Glance
 
 ```
