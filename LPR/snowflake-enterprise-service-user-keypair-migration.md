@@ -26,8 +26,8 @@ Replaces password-based Snowflake login with RSA key pair authentication for `EN
 | [ENT-11804](https://openedx.atlassian.net/browse/ENT-11804) | Migrate `ENTERPRISE_SERVICE_USER` to key pair authentication |
 | [ENT-11803](https://openedx.atlassian.net/browse/ENT-11803) | Document and identify LPR data flow and usage points |
 | [DPSD-11928](https://openedx.atlassian.net/browse/DPSD-11928) | Parent tracking ticket for service-user authentication migrations |
-| [DOS-6253][(https://2u-internal.atlassian.net/browse/DOS-6253)] | Prior example of a service-user key pair migration |
-| [DPSD-9693][(https://2u-internal.atlassian.net/browse/DPSD-9693)] | Prior example from Data Platform |
+| [DOS-6253](https://2u-internal.atlassian.net/browse/DOS-6253) | Prior example of a service-user key pair migration |
+| [DPSD-9693](https://2u-internal.atlassian.net/browse/DPSD-9693) | Prior example from Data Platform |
 
 ---
 
