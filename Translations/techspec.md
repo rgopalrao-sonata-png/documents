@@ -23,6 +23,55 @@ Where does the text come from?
 | **C** | Dynamic catalog content | Real engineering (generalize Spanish-only pipeline) | Catalog / Enterprise | Partial |
 | **D** | Admin-authored content | None (deliberate non-goal) | Product | Out of scope |
 
+```mermaid
+flowchart TD
+    subgraph Source["Text Sources"]
+        A1["Hard-coded UI strings\n(defineMessages / JSX)"]
+        A2["Catalog API\n(course titles, descriptions)"]
+        A3["Admin-typed content\n(plan names, emails)"]
+    end
+
+    subgraph TrackA["Track A — Static UI (Automated)"]
+        B1["FormatJS extraction\n(make i18n.extract)"]
+        B2["transifex_input.json"]
+        B3["ai-translations service\n(OpenAI-backed)"]
+        B4["openedx-translations repo\n(locale/*.json)"]
+        B5["make pull_translations\n(atlas pull)"]
+        B6["src/i18n/messages/\n(bundled at build)"]
+    end
+
+    subgraph TrackB["Track B — Language Selectability (Config)"]
+        C1["edx-platform\nDarkLangConfig.released_languages"]
+        C2["User resolves locale from:\ncookie → account pref → Accept-Language"]
+    end
+
+    subgraph TrackC["Track C — Catalog Content (Engineering)"]
+        D1["enterprise-catalog\ntranslate_object_fields()"]
+        D2["Algolia index\n{objectID}-<locale>"]
+        D3["Frontend catalog/search\nfilter by metadata_language"]
+    end
+
+    subgraph TrackD["Track D — Admin Content (Out of Scope)"]
+        E1["Leave as-authored\nNo translation path"]
+    end
+
+    A1 --> TrackA
+    B1 --> B2 --> B3 --> B4 --> B5 --> B6
+    B6 -->|"IntlProvider wraps app\n(@edx/frontend-platform)"| F["Rendered UI\nin user's language"]
+
+    A2 --> TrackC
+    D1 --> D2 --> D3 --> F
+
+    A3 --> TrackD
+
+    C1 --> C2 --> F
+
+    style TrackA fill:#d4edda,stroke:#28a745
+    style TrackB fill:#cce5ff,stroke:#004085
+    style TrackC fill:#fff3cd,stroke:#856404
+    style TrackD fill:#f8d7da,stroke:#721c24
+```
+
 ---
 
 ## Track A — Static UI strings
@@ -30,6 +79,25 @@ Where does the text come from?
 Strings from `defineMessages` are extracted, machine-translated by the central
 `ai-translations` service, and pulled into the bundle at build. For a language already on
 the platform, **this is automatic — no change in this repo.**
+
+```mermaid
+sequenceDiagram
+    participant Dev as Developer
+    participant MFE as admin-portal (this repo)
+    participant FP as frontend-platform
+    participant OT as openedx-translations repo
+    participant AI as ai-translations service
+    participant Build as CI / Build
+
+    Dev->>MFE: defineMessages({ id, defaultMessage })
+    MFE->>MFE: make i18n.extract → transifex_input.json
+    MFE->>OT: PR / job pushes source strings
+    OT->>AI: POST /api/v1/static_strings/json/translate
+    AI-->>OT: translated locale JSON (e.g. uz.json ~71%)
+    Build->>MFE: make pull_translations (atlas)
+    MFE->>MFE: src/i18n/messages/<locale>.json bundled
+    MFE-->>Dev: UI renders in user's locale at runtime
+```
 
 1. **Register the locale in `frontend-platform`** *(only if new to the platform)* —
    `supportedLocales`, FormatJS locale-data imports, `countries.js`, and test counts in
